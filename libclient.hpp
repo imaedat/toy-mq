@@ -13,6 +13,7 @@ class publisher
     publisher(std::string_view ipaddr, uint16_t port)
         : sock_(ipaddr, port)
     {
+        sock_.set_nonblock(false);
     }
 
     void publish(std::string_view topic, std::string_view msg)
@@ -50,6 +51,7 @@ class subscriber
     subscriber(std::string_view ipaddr, uint16_t port)
         : sock_(ipaddr, port)
     {
+        sock_.set_nonblock(false);
     }
 
     void subscribe(std::string_view topic,
@@ -58,13 +60,16 @@ class subscriber
         sock_.connect();
         helper::sendmsg(sock_.native_handle(), command::subscribe, topic);
 
-        sock_.set_nonblock(false);
         while (true) {
             auto [msg, ec] = helper::recvmsg(sock_.native_handle());
             if (ec) {
                 printf("subscribe: receive error: %s\n", ec.message().c_str());
+                if (ec.value() == EAGAIN || ec.value() == EWOULDBLOCK) {
+                    continue;
+                }
                 break;
             }
+            // printf("send_ack for msg %lu\n", msg.id());
             helper::send_ack(sock_.native_handle(), msg.id());
 
             subscriber::message m;

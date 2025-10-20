@@ -20,13 +20,16 @@ static constexpr uint8_t VERSION = 1;
 enum class command : uint8_t
 {
     void_ = 0,
-    handshake,
+    conn_pub,
+    conn_sub,
+    ack,
+    nack,
     publish,
+    publish_ack,
     publish_oneshot,
     subscribe,
     unsubscribe,
     push,
-    ack,
     close,
 };
 
@@ -96,7 +99,7 @@ struct message
 
     uint64_t id() const noexcept
     {
-        return *(uint64_t*)(buf.data() + length() - sizeof(uint64_t));
+        return be64toh(*(uint64_t*)(buf.data() + length() - sizeof(uint64_t)));
     }
 
     void id(uint64_t new_id) noexcept
@@ -124,37 +127,42 @@ struct message
 };
 
 namespace helper {
+int recv_exact(int sockfd, void* buf, size_t size, bool retry)
+{
+    auto* ptr = (uint8_t*)buf;
+    long want = size;
+    while (want > 0) {
+        auto nread = ::read(sockfd, ptr, want);
+        if (nread < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && retry) {
+                continue;
+            }
+            return errno;
+        }
+        if (nread == 0) {
+            return ENOENT;
+        }
+        ptr += nread;
+        want -= nread;
+    }
+    return 0;  // SUCCESS
+}
+
 std::pair<message, std::error_code> recvmsg(int sockfd)
 {
     message msg;
-    auto* p = (uint8_t*)msg.hdr();
-    long want = sizeof(header);
-again1:
-    auto nread = ::read(sockfd, p, want);
-    if (nread < 0) {
-        return {std::move(msg), std::error_code(errno, std::generic_category())};
-    } else if (nread < want) {
-        p += nread;
-        want -= nread;
-        goto again1;
+    if (auto err = recv_exact(sockfd, msg.hdr(), sizeof(header), false)) {
+        return {std::move(msg), std::error_code(err, std::generic_category())};
     }
 
     std::error_code ec;
     if (msg.length() > sizeof(header)) {
         msg.resize(msg.length());
-        p = msg.payload();
-        want = msg.payload_size();
-    again2:
-        auto nread = ::read(sockfd, p, want);
-        if (nread < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                goto again2;
-            }
-            ec = std::error_code(errno, std::generic_category());
-        } else if (nread < want) {
-            p += nread;
-            want -= nread;
-            goto again2;
+        if (auto err = recv_exact(sockfd, msg.payload(), msg.payload_size(), true)) {
+            ec = std::error_code(err, std::generic_category());
         }
     }
 
@@ -211,7 +219,7 @@ std::error_code send_ack(int sockfd, uint64_t msgid)
     *(uint64_t*)hdr->payload = htobe64(msgid);
 
     std::error_code ec;
-    if (::write(sockfd, hdr, msgsz) < 0) {
+    if (::send(sockfd, hdr, msgsz, MSG_NOSIGNAL) < 0) {
         ec = std::error_code(errno, std::generic_category());
     }
     return ec;
