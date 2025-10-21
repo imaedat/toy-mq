@@ -13,12 +13,32 @@
 #include "socket.hpp"
 #include "thread_pool.hpp"
 
-#undef BROKER_VERBOSE
-
 using namespace tbd;
 using namespace std::chrono;
 
 namespace toymq {
+
+enum verbosity
+{
+    quiet = 0,
+    error,
+    warn,
+    info,
+    debug,
+};
+int verbosity_ = verbosity::info;
+
+#define LOG_(lv, ...)                                                                              \
+    do {                                                                                           \
+        if (verbosity_ >= (lv)) {                                                                  \
+            printf(__VA_ARGS__);                                                                   \
+        }                                                                                          \
+    } while (0)
+
+#define DEBUG(...) LOG_(verbosity::debug, __VA_ARGS__)
+#define INFO(...) LOG_(verbosity::info, __VA_ARGS__)
+#define WARN(...) LOG_(verbosity::warn, __VA_ARGS__)
+#define ERROR(...) LOG_(verbosity::error, __VA_ARGS__)
 
 class broker;
 
@@ -35,6 +55,7 @@ class client
     broker& broker_;
     io_socket sock_;
     std::string role_;
+    std::mutex mtx_sock_;
 
     client(broker& b, io_socket& s) noexcept
         : broker_(b)
@@ -101,15 +122,13 @@ class subscriber : public client
             match = (pos == 0 && (msg_topic.size() == topic_.size() || topic_.back() == '.'));
         }
 
-#ifdef BROKER_VERBOSE
-        printf("sub-%d: my topic [%s], msg topic [%s] => match=%s\n", sock_.native_handle(),
-               topic_.c_str(), msg_topic.data(), match ? "true" : "false");
-#endif
+        DEBUG("sub-%d: my topic [%s], msg topic [%s] => match=%s\n", sock_.native_handle(),
+              topic_.c_str(), msg_topic.data(), match ? "true" : "false");
         return match;
     }
 
     void push(const std::shared_ptr<message>& msg);
-    void drain_messages();
+    void flush();
 
   private:
     std::string topic_;
@@ -125,20 +144,24 @@ class subscriber : public client
 class broker
 {
     static constexpr uint16_t DEFAULT_PORT = 5555;
-    static constexpr size_t DEFAULT_WORKERS = 2;
     static constexpr size_t DEFAULT_MAX_MESSAGES = 1024;
     static constexpr unsigned DEFAULT_WATERMARK = 80;
     static constexpr unsigned DEFAULT_MESSAGE_TTL = 3600;
     static constexpr int DEFAULT_PUBLISH_MAXITERS = 128;
     static constexpr int DEFAULT_SUBSCRIBE_MAXITERS = 0;
+    static constexpr size_t DEFAULT_ROUTERS = 2;
+    static constexpr size_t DEFAULT_FLUSHERS = 2;
 
   public:
     explicit broker(const config& cfg)
         : cfg_(cfg)
         , srvsock_((uint16_t)cfg_.get<int>("listen_port", DEFAULT_PORT))
-        , thpool_(cfg_.get<int>("worker_threads", DEFAULT_WORKERS))
         , running_(true)
+        , nrouters_(cfg.get<int>("router_threads", DEFAULT_ROUTERS))
+        , routers_(nrouters_)
+        , flushers_(cfg_.get<int>("flusher_threads", DEFAULT_FLUSHERS))
     {
+        verbosity_ = cfg_.get<int>("verbosity", verbosity::info);
         start_residents();
         epollfd_.add(srvsock_.native_handle());
     }
@@ -162,19 +185,26 @@ class broker
         std::chrono::system_clock::time_point expiry;
         std::unordered_set<const subscriber*> subscribers;
     };
-    struct routing_req
+    struct delivery_req
     {
         uint64_t msgid;
         std::shared_ptr<message> msg;
         std::unordered_map<int, std::shared_ptr<subscriber>> subscribers;
 
-        routing_req(uint64_t id, std::shared_ptr<message>& m,
-                    const std::unordered_map<int, std::shared_ptr<subscriber>>& ss)
+        delivery_req(uint64_t id, std::shared_ptr<message>& m,
+                     const std::unordered_map<int, std::shared_ptr<subscriber>>& ss)
             : msgid(id)
             , msg(std::move(m))
             , subscribers(ss)  // snapshot
         {
         }
+    };
+    struct router
+    {
+        std::thread thr;
+        std::condition_variable cv;
+        std::mutex mtx;
+        std::deque<delivery_req> queue;
     };
     struct metrics
     {
@@ -186,21 +216,21 @@ class broker
 
     config cfg_;
     tcp_server srvsock_;
-    thread_pool thpool_;
-    std::mutex mtx_;
     epollfd epollfd_;
-    bool running_;
+    std::atomic<bool> running_{false};
     // router
-    std::thread router_;
-    std::condition_variable cv_router_;
-    std::deque<routing_req> deliveryq_;
+    size_t nrouters_;
+    std::vector<router> routers_;
+    thread_pool flushers_;
     // keeper
     std::thread keeper_;
-    std::condition_variable cv_keeper_;
+    tbd::eventfd ev_keeper_;
     // sampler
     std::thread sampler_;
-    std::condition_variable cv_sampler_;
+    tbd::eventfd ev_sampler_;
     metrics metrics_;
+    // XXX
+    // thread_pool reactors_{4};
 
     // { fd => client }
     std::unordered_map<int, std::unique_ptr<publisher>> publishers_;
@@ -208,57 +238,67 @@ class broker
 
     // { msgid => { msg, expiry, subscribers } }
     std::map<uint64_t, unacked_msg> unacked_msgs_;
+    std::mutex mtx_;
 
+    // main
     void run_one()
     {
-        const auto pub_max = cfg_.get<int>("publish_maxiters", DEFAULT_PUBLISH_MAXITERS);
-        const auto sub_max = cfg_.get<int>("subscribe_maxiters", DEFAULT_SUBSCRIBE_MAXITERS);
+        static const auto pub_max = cfg_.get<int>("publish_maxiters", DEFAULT_PUBLISH_MAXITERS);
+        static const auto sub_max = cfg_.get<int>("subscribe_maxiters", DEFAULT_SUBSCRIBE_MAXITERS);
 
         auto events = epollfd_.wait();
         for (const auto& ev : events) {
-            if (ev.fd == srvsock_.native_handle()) {
+            auto fd = ev.fd;
+            if (fd == srvsock_.native_handle()) {
                 accept_new_client();
                 continue;
             }
 
-            auto it = subscribers_.find(ev.fd);
+            // reactors_.submit([this, fd] {
+            auto it = subscribers_.find(fd);
             if (it != subscribers_.end()) {
                 it->second->handle(sub_max);
             } else {
-                publishers_[ev.fd]->handle(pub_max);
+                publishers_[fd]->handle(pub_max);
             }
+            // });
         }
     }
 
+    // main
     void accept_new_client()
     {
         auto sock = srvsock_.accept();
         // sock.set_nonblock(false);
         int fd = sock.native_handle();
+    again:
         auto [msg, ec] = helper::recvmsg(sock.native_handle());
         if (ec) {
-            printf("accept_new_client: recv error (fd=%d): %s\n", sock.native_handle(),
-                   ec.message().c_str());
+            ERROR("accept_new_client: recv error (fd=%d): %s\n", sock.native_handle(),
+                  ec.message().c_str());
+            if (ec.value() == EAGAIN || ec.value() == EWOULDBLOCK) {
+                goto again;
+            }
             return;
         }
 
         switch (msg.command()) {
         case command::publish_oneshot: {
-            enqueue_delivery(msg);
+            enqueue_delivery(msg, fd);
             // `sock` closed on scope end, return w/o epoll registration
             return;
         }
 
         case command::publish: {
-            printf("broker: accept new publisher (fd=%d)\n", fd);
+            INFO("broker: accept new publisher (fd=%d)\n", fd);
             publishers_.emplace(fd, std::make_unique<publisher>(*this, sock));
             epollfd_.add(fd);
-            enqueue_delivery(msg);
+            enqueue_delivery(msg, fd);
             break;
         }
 
         case command::subscribe: {
-            printf("broker: accept new subscriber (fd=%d)\n", fd);
+            INFO("broker: accept new subscriber (fd=%d)\n", fd);
             subscribers_.emplace(fd, std::make_shared<subscriber>(*this, sock, msg.topic()));
             epollfd_.add(fd);
             redeliver(subscribers_[fd].get());
@@ -286,22 +326,26 @@ class broker
      */
     void start_residents()
     {
-        router_ = std::thread([this] { msg_router(); });
+        for (size_t i = 0; i < nrouters_; ++i) {
+            routers_[i].thr = std::thread([this, i] { msg_router(i); });
+        }
         keeper_ = std::thread([this] { house_keeper(); });
         sampler_ = std::thread([this] { sampler(); });
     }
 
     void stop_residents()
     {
-        {
-            std::lock_guard<decltype(mtx_)> lk(mtx_);
-            running_ = false;
-            cv_router_.notify_one();
-            cv_keeper_.notify_one();
-            cv_sampler_.notify_one();
+        running_ = false;
+        for (auto&& r : routers_) {
+            r.cv.notify_one();
         }
-        if (router_.joinable()) {
-            router_.join();
+        ev_keeper_.write(1);
+        ev_sampler_.write(1);
+
+        for (auto&& r : routers_) {
+            if (r.thr.joinable()) {
+                r.thr.join();
+            }
         }
         if (keeper_.joinable()) {
             keeper_.join();
@@ -311,15 +355,16 @@ class broker
         }
     }
 
-    void msg_router()
+    void msg_router(size_t i)
     {
         const auto ttl = seconds(cfg_.get<int>("message_ttl_sec", DEFAULT_MESSAGE_TTL));
         const size_t max = cfg_.get<int>("max_messages", DEFAULT_MAX_MESSAGES);
+        auto& rt = routers_[i];
 
-        std::unique_lock<decltype(mtx_)> lk(mtx_);
+        std::unique_lock<std::mutex> lk(rt.mtx);
         while (true) {
-            bool enq = cv_router_.wait_for(lk, seconds(10),
-                                           [this] { return !deliveryq_.empty() || !running_; });
+            bool enq = rt.cv.wait_for(lk, seconds(10),
+                                      [this, &rt] { return !rt.queue.empty() || !running_; });
             if (!running_) {
                 break;
             }
@@ -327,8 +372,8 @@ class broker
                 continue;
             }
 
-            auto req = std::move(deliveryq_.front());
-            deliveryq_.pop_front();
+            auto req = std::move(rt.queue.front());
+            rt.queue.pop_front();
             lk.unlock();
 
             const auto& topic = req.msg->topic();
@@ -344,16 +389,13 @@ class broker
                 unacked.msg = std::move(req.msg);
                 unacked.expiry = system_clock::now() + ttl;
 
-                std::lock_guard<decltype(mtx_)> lk(mtx_);
-#ifdef BROKER_VERBOSE
-                printf("broker: curr unacked = %lu, enq %lu\n", unacked_msgs_.size(), req.msgid);
-#endif
+                std::lock_guard<decltype(mtx_)> lk2(mtx_);
+                DEBUG("router-%lu: #unacked %lu, enq %lu\n", i, unacked_msgs_.size(), req.msgid);
                 if (unacked_msgs_.size() >= max) {
                     unacked_msgs_.erase(unacked_msgs_.begin());  // O(log n)
                 }
                 assert(unacked_msgs_.find(req.msgid) == unacked_msgs_.end());
-                unacked_msgs_.emplace(req.msgid, std::move(unacked));  // O(log n)
-                auto it = unacked_msgs_.rbegin();                      // O(1)
+                auto [it, _] = unacked_msgs_.emplace(req.msgid, std::move(unacked));  // O(log n)
                 for (auto&& sub : it->second.subscribers) {
                     (const_cast<subscriber*>(sub))->push(it->second.msg);
                 }
@@ -365,31 +407,34 @@ class broker
 
     void house_keeper()
     {
-        std::unique_lock<decltype(mtx_)> lk(mtx_);
+        tbd::poll poller(*ev_keeper_);
         while (true) {
-            cv_keeper_.wait_for(lk, minutes(1), [this] { return !running_; });
+            (void)poller.wait(60 * 1000);
             if (!running_) {
                 break;
             }
 
-            auto now = system_clock::now();
-            auto it = unacked_msgs_.begin();
-            while (it != unacked_msgs_.end()) {  // O(n)
-                if (it->second.expiry > now) {
-                    break;
+            {
+                std::lock_guard<decltype(mtx_)> lk(mtx_);
+                auto now = system_clock::now();
+                auto it = unacked_msgs_.begin();
+                while (it != unacked_msgs_.end()) {  // O(n)
+                    if (it->second.expiry > now) {
+                        break;
+                    }
+                    WARN("keeper: erase msgid %lu\n", it->first);
+                    it = unacked_msgs_.erase(it);  // O(1)
+                    metrics_.backlog.fetch_sub(1, std::memory_order_relaxed);
                 }
-                printf("keeper: erase msgid %lu\n", it->first);
-                it = unacked_msgs_.erase(it);  // O(1)
-                metrics_.backlog.fetch_sub(1, std::memory_order_relaxed);
             }
         }
     }
 
     void sampler()
     {
-        std::unique_lock<decltype(mtx_)> lk(mtx_);
+        tbd::poll poller(*ev_sampler_);
         while (true) {
-            cv_sampler_.wait_for(lk, seconds(1), [this] { return !running_; });
+            (void)poller.wait(1000);
             if (!running_) {
                 break;
             }
@@ -399,8 +444,8 @@ class broker
             auto egress = metrics_.egress.exchange(0, std::memory_order_relaxed);
             auto ack = metrics_.ack.exchange(0, std::memory_order_relaxed);
 
-            printf("sampler: ingress %lu, egress %lu, ack %lu, backlog %lu\n", ingress, egress, ack,
-                   backlog);
+            INFO("sampler: ingress %lu, egress %lu, ack %lu, backlog %lu\n", ingress, egress, ack,
+                 backlog);
         }
     }
 
@@ -408,6 +453,7 @@ class broker
      * from client
      */
   public:
+    // main
     void close_client(int fd)
     {
         epollfd_.del(fd);
@@ -423,12 +469,13 @@ class broker
      * from publisher
      */
   public:
-    bool enqueue_delivery(const message& orig_msg)
+    // main
+    bool enqueue_delivery(const message& orig_msg, int fd)
     {
         metrics_.ingress.fetch_add(1, std::memory_order_relaxed);
 
         if (!under_watermark()) {
-            printf("broker: !!! unacked msgs over watermark, reject new msg !!!\n");
+            WARN("broker: !!! unacked msgs over watermark, reject new msg !!!\n");
             return false;
         }
 
@@ -437,18 +484,20 @@ class broker
         new_msg->resize(new_msg->length() + sizeof(msgid));
         new_msg->id(msgid);
 
-        std::lock_guard<decltype(mtx_)> lk(mtx_);
-        deliveryq_.emplace_back(msgid, new_msg, subscribers_);
-        cv_router_.notify_one();
+        auto& rt = routers_[fd % nrouters_];
+        std::lock_guard<std::mutex> lk(rt.mtx);
+        rt.queue.emplace_back(msgid, new_msg, subscribers_);
+        rt.cv.notify_one();
 
         return true;
     }
 
   private:
+    // main
     uint64_t next_id() const noexcept
     {
         if (cfg_.get<bool>("debug_seqid", false)) {
-            static uint64_t msgid_ = 0;
+            static std::atomic<uint64_t> msgid_ = 0;
             return ++msgid_;
         }
 
@@ -459,7 +508,7 @@ class broker
         uint64_t newid = duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
         if (newid <= previd_) {
             if (attempts >= 100) {
-                printf("broker: cannot generate newid: %lu, %lu\n", newid, previd_);
+                WARN("broker: cannot generate newid: %lu, %lu\n", newid, previd_);
                 std::this_thread::sleep_for(seconds(1));
             }
             goto again;
@@ -468,6 +517,7 @@ class broker
         return newid;
     }
 
+    // main
     bool under_watermark()
     {
         const auto max = cfg_.get<int>("max_messages", DEFAULT_MAX_MESSAGES);
@@ -481,6 +531,7 @@ class broker
      * from subscriber
      */
   public:
+    // main
     void receive_ack(const subscriber* sub, uint64_t msgid)
     {
         metrics_.ack.fetch_add(1, std::memory_order_relaxed);
@@ -492,12 +543,11 @@ class broker
         if (it->second.subscribers.empty()) {
             unacked_msgs_.erase(it);  // O(1)
             metrics_.backlog.fetch_sub(1, std::memory_order_relaxed);
-#ifdef BROKER_VERBOSE
-            printf("broker: all subs sent ack for msg %lu\n", msgid);
-#endif
+            DEBUG("broker: all subs sent ack for msg %lu\n", msgid);
         }
     }
 
+    // main
     void unsubscribe(const subscriber* sub, int fd)
     {
         close_client(fd);
@@ -519,9 +569,10 @@ class broker
         }
     }
 
-    void drain(subscriber* sub)
+    // router
+    void enqueue_flush(subscriber* sub)
     {
-        thpool_.submit([this, sub] { sub->drain_messages(); });
+        flushers_.submit([this, sub] { sub->flush(); });
     }
 
     void increment_egress(uint64_t n = 1)
@@ -533,26 +584,30 @@ class broker
 /****************************************************************************
  * clients
  */
+// main
 void client::handle(int max_iters)
 {
     for (int i = 0; (max_iters == 0 || i < max_iters); ++i) {
+        // XXX
+        // std::unique_lock<std::mutex> lk(mtx_sock_);
         auto [msg, ec] = helper::recvmsg(sock_.native_handle());
+        // lk.unlock();
         if (ec) {
             if (ec.value() == EAGAIN || ec.value() == EWOULDBLOCK) {
                 return;
             }
             if (ec.value() == ENOENT) {
-                printf("%s-%d: connection closed by peer\n", role().c_str(), sock_.native_handle());
+                INFO("%s-%d: connection closed by peer\n", role().c_str(), sock_.native_handle());
             } else {
-                printf("%s-%d: recv error: %s\n", role().c_str(), sock_.native_handle(),
-                       ec.message().c_str());
+                ERROR("%s-%d: recv error: %s\n", role().c_str(), sock_.native_handle(),
+                      ec.message().c_str());
             }
             broker_.close_client(sock_.native_handle());
             return;
         }
 
         if (msg.command() == command::close) {
-            printf("%s-%d: close\n", role().c_str(), sock_.native_handle());
+            INFO("%s-%d: close\n", role().c_str(), sock_.native_handle());
             broker_.close_client(sock_.native_handle());
             return;
         }
@@ -563,20 +618,19 @@ void client::handle(int max_iters)
     }
 }
 
+// main
 bool publisher::dispatch(const message& msg) const
 {
     switch (msg.command()) {
     case command::publish:
-#ifdef BROKER_VERBOSE
-        printf("pub-%d: publish for [%s]\n", sock_.native_handle(), msg.topic().data());
-#endif
-        if (!broker_.enqueue_delivery(msg)) {
+        DEBUG("pub-%d: publish for [%s]\n", sock_.native_handle(), msg.topic().data());
+        if (!broker_.enqueue_delivery(msg, sock_.native_handle())) {
             return false;
         }
         break;
 
     default:
-        printf("pub-%d: unexpected command [%x]\n", sock_.native_handle(), (uint8_t)msg.command());
+        ERROR("pub-%d: unexpected command [%x]\n", sock_.native_handle(), (uint8_t)msg.command());
         broker_.close_client(sock_.native_handle());
         return false;
     }
@@ -584,23 +638,22 @@ bool publisher::dispatch(const message& msg) const
     return true;
 }
 
+// main
 bool subscriber::dispatch(const message& msg) const
 {
     switch (msg.command()) {
     case command::ack:
-#ifdef BROKER_VERBOSE
-        printf("sub-%d: ack for msg %lu\n", sock_.native_handle(), msg.id());
-#endif
+        DEBUG("sub-%d: ack for msg %lu\n", sock_.native_handle(), msg.id());
         broker_.receive_ack(this, msg.id());
         break;
 
     case command::unsubscribe:
-        printf("sub-%d: unsubscribe\n", sock_.native_handle());
+        INFO("sub-%d: unsubscribe\n", sock_.native_handle());
         broker_.unsubscribe(this, sock_.native_handle());
         return false;
 
     default:
-        printf("sub-%d: unexpected command [%x]\n", sock_.native_handle(), (uint8_t)msg.command());
+        ERROR("sub-%d: unexpected command [%x]\n", sock_.native_handle(), (uint8_t)msg.command());
         broker_.close_client(sock_.native_handle());
         return false;
     }
@@ -608,14 +661,16 @@ bool subscriber::dispatch(const message& msg) const
     return true;
 }
 
+// router
 void subscriber::push(const std::shared_ptr<message>& msg)
 {
     std::lock_guard<decltype(mtx_)> lk(mtx_);
     drainq_.emplace_back(msg);
-    broker_.drain(this);
+    broker_.enqueue_flush(this);
 }
 
-void subscriber::drain_messages()
+// thread pool
+void subscriber::flush()
 {
     std::lock_guard<decltype(mtx_)> lk(mtx_);
     if (!drainq_.empty()) {
@@ -628,7 +683,15 @@ void subscriber::drain_messages()
         struct msghdr msg = {};
         msg.msg_iov = iov;
         msg.msg_iovlen = iovcnt;
-        ::sendmsg(sock_.native_handle(), &msg, MSG_NOSIGNAL);
+    again:
+        auto nbytes = ::sendmsg(sock_.native_handle(), &msg, MSG_NOSIGNAL);
+        if (nbytes < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                goto again;
+            } else {
+                ERROR("pool: !!! sendmsg error !!!: %s\n", strerror(errno));
+            }
+        }
         drainq_.clear();
         broker_.increment_egress(iovcnt);
     }

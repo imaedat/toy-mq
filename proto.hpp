@@ -205,7 +205,7 @@ std::error_code sendmsg(int sockfd, command c, std::string_view topic = "",
     }
 
     std::error_code ec;
-    if (::write(sockfd, hdr, msgsz) < 0) {
+    if (::send(sockfd, hdr, msgsz, MSG_NOSIGNAL) < 0) {
         ec = std::error_code(errno, std::generic_category());
     }
     return ec;
