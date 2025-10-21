@@ -1,5 +1,5 @@
-#ifndef MQ_PROTO_HPP_
-#define MQ_PROTO_HPP_
+#ifndef TOYMQ_PROTO_HPP_
+#define TOYMQ_PROTO_HPP_
 
 #include <arpa/inet.h>
 #include <unistd.h>

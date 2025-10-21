@@ -1,5 +1,5 @@
-#ifndef MQ_LIB_CLIENT_HPP_
-#define MQ_LIB_CLIENT_HPP_
+#ifndef TOYMQ_LIB_CLIENT_HPP_
+#define TOYMQ_LIB_CLIENT_HPP_
 
 #include "proto.hpp"
 
@@ -24,7 +24,7 @@ class publisher
     void publish(std::string_view topic, const void* data, size_t size)
     {
         sock_.connect();
-        auto ec = helper::sendmsg(sock_.native_handle(), command::publish, topic, data, size);
+        auto ec = helper::sendmsg(*sock_, command::publish, topic, data, size);
         if (ec) {
             throw std::system_error(ec);
         }
@@ -32,7 +32,7 @@ class publisher
 
     void close()
     {
-        helper::sendmsg(sock_.native_handle(), command::close);
+        helper::sendmsg(*sock_, command::close);
     }
 
   private:
@@ -58,10 +58,10 @@ class subscriber
                    const std::function<bool(const subscriber::message& msg)>& callback)
     {
         sock_.connect();
-        helper::sendmsg(sock_.native_handle(), command::subscribe, topic);
+        helper::sendmsg(*sock_, command::subscribe, topic);
 
         while (true) {
-            auto [msg, ec] = helper::recvmsg(sock_.native_handle());
+            auto [msg, ec] = helper::recvmsg(*sock_);
             if (ec) {
                 printf("subscribe: receive error: %s\n", ec.message().c_str());
                 if (ec.value() == EAGAIN || ec.value() == EWOULDBLOCK) {
@@ -70,7 +70,7 @@ class subscriber
                 break;
             }
             // printf("send_ack for msg %lu\n", msg.id());
-            helper::send_ack(sock_.native_handle(), msg.id());
+            helper::send_ack(*sock_, msg.id());
 
             subscriber::message m;
             m.topic = msg.topic();
@@ -83,7 +83,7 @@ class subscriber
 
     void unsubscribe()
     {
-        helper::sendmsg(sock_.native_handle(), command::unsubscribe);
+        helper::sendmsg(*sock_, command::unsubscribe);
     }
 
   private:
