@@ -24,6 +24,11 @@ class publisher
     void publish(std::string_view topic, const void* data, size_t size)
     {
         sock_.connect();
+        if (once_flag_) {
+            auto [_, lport] = sock_.local_endpoint();
+            printf("publisher: localport = %u\n", lport);
+            once_flag_ = false;
+        }
         auto ec = helper::sendmsg(*sock_, command::publish, topic, data, size);
         if (ec) {
             throw std::system_error(ec);
@@ -37,6 +42,7 @@ class publisher
 
   private:
     tbd::tcp_client sock_;
+    bool once_flag_ = true;
 };
 
 class subscriber
@@ -58,6 +64,8 @@ class subscriber
                    const std::function<bool(const subscriber::message& msg)>& callback)
     {
         sock_.connect();
+        auto [_, lport] = sock_.local_endpoint();
+        printf("subscriber: localport = %u\n", lport);
         helper::sendmsg(*sock_, command::subscribe, topic);
 
         while (true) {

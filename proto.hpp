@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -11,7 +12,7 @@
 #include <vector>
 
 // XXX
-// #include "hexdump.h"
+#include "hexdump.h"
 
 namespace toymq {
 
@@ -127,17 +128,17 @@ struct message
 };
 
 namespace helper {
-int recv_exact(int sockfd, void* buf, size_t size, bool retry)
+int recv_exact(int sockfd, void* buf, size_t size, bool waitall = true)
 {
     auto* ptr = (uint8_t*)buf;
     long want = size;
     while (want > 0) {
-        auto nread = ::read(sockfd, ptr, want);
+        auto nread = ::recv(sockfd, ptr, want, waitall ? MSG_WAITALL : 0);
         if (nread < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            if ((errno == EAGAIN || errno == EWOULDBLOCK) && retry) {
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && waitall) {
                 continue;
             }
             return errno;
@@ -148,13 +149,14 @@ int recv_exact(int sockfd, void* buf, size_t size, bool retry)
         ptr += nread;
         want -= nread;
     }
+    assert(want == 0);
     return 0;  // SUCCESS
 }
 
-std::pair<message, std::error_code> recvmsg(int sockfd)
+std::pair<message, std::error_code> recvmsg(int sockfd, bool wait_hdr = false)
 {
     message msg;
-    if (auto err = recv_exact(sockfd, msg.hdr(), sizeof(header), false)) {
+    if (auto err = recv_exact(sockfd, msg.hdr(), sizeof(header), wait_hdr)) {
         return {std::move(msg), std::error_code(err, std::generic_category())};
     }
 
@@ -204,11 +206,27 @@ std::error_code sendmsg(int sockfd, command c, std::string_view topic = "",
         ::memcpy(d, data, datasz);
     }
 
-    std::error_code ec;
-    if (::send(sockfd, hdr, msgsz, MSG_NOSIGNAL) < 0) {
-        ec = std::error_code(errno, std::generic_category());
+    auto* ptr = (uint8_t*)hdr;
+    long want = msgsz;
+    while (want > 0) {
+        auto nwritten = ::send(sockfd, ptr, want, MSG_NOSIGNAL);
+        if (nwritten < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            return std::error_code(errno, std::generic_category());
+        }
+        if (nwritten == 0) {
+            return std::error_code(ENOENT, std::generic_category());
+        }
+        ptr += nwritten;
+        want -= nwritten;
     }
-    return ec;
+    assert(want == 0);
+    return std::error_code();
 }
 
 std::error_code send_ack(int sockfd, uint64_t msgid)
