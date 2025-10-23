@@ -50,6 +50,12 @@ struct message
         : buf(sizeof(header), 0)
     {
     }
+    message(const message& orig, uint64_t msgid)
+        : message(orig)
+    {
+        resize(length() + sizeof(msgid));
+        id(msgid);
+    }
 
     message(const message&) = default;
     message& operator=(const message&) = delete;
