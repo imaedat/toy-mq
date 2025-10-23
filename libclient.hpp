@@ -69,7 +69,7 @@ class subscriber
         helper::sendmsg(*sock_, command::subscribe, topic);
 
         while (true) {
-            auto [msg, ec] = helper::recvmsg(*sock_);
+            auto [msg, ec] = helper::recvmsg(*sock_, true);
             if (ec) {
                 printf("subscribe: receive error: %s\n", ec.message().c_str());
                 if (ec.value() == EAGAIN || ec.value() == EWOULDBLOCK) {

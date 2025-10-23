@@ -133,7 +133,7 @@ int recv_exact(int sockfd, void* buf, size_t size, bool waitall = true)
     auto* ptr = (uint8_t*)buf;
     long want = size;
     while (want > 0) {
-        auto nread = ::recv(sockfd, ptr, want, waitall ? MSG_WAITALL : 0);
+        auto nread = ::recv(sockfd, ptr, want, waitall ? MSG_WAITALL : MSG_DONTWAIT);
         if (nread < 0) {
             if (errno == EINTR) {
                 continue;
