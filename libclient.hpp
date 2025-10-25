@@ -16,12 +16,12 @@ class publisher
         sock_.set_nonblock(false);
     }
 
-    void publish(std::string_view topic, std::string_view msg)
+    bool publish(std::string_view topic, std::string_view msg, bool require_ack = false)
     {
-        publish(topic, msg.data(), msg.size());
+        return publish(topic, msg.data(), msg.size(), require_ack);
     }
 
-    void publish(std::string_view topic, const void* data, size_t size)
+    bool publish(std::string_view topic, const void* data, size_t size, bool require_ack)
     {
         sock_.connect();
         if (once_flag_) {
@@ -29,10 +29,18 @@ class publisher
             printf("publisher: localport = %u\n", lport);
             once_flag_ = false;
         }
-        auto ec = helper::sendmsg(*sock_, command::publish, topic, data, size);
-        if (ec) {
-            throw std::system_error(ec);
+        auto c = require_ack ? command::publish_ack : command::publish;
+        if (auto ec = helper::sendmsg(*sock_, c, topic, data, size)) {
+            throw std::system_error(ec, "sendmsg");
         }
+        if (require_ack) {
+            auto [msg, ec] = helper::recvmsg(*sock_, true);
+            if (ec) {
+                throw std::system_error(ec, "recvmsg");
+            }
+            return msg.command() == command::ack;
+        }
+        return true;
     }
 
     void close()
@@ -71,10 +79,7 @@ class subscriber
         while (true) {
             auto [msg, ec] = helper::recvmsg(*sock_, true);
             if (ec) {
-                printf("subscribe: receive error: %s\n", ec.message().c_str());
-                if (ec.value() == EAGAIN || ec.value() == EWOULDBLOCK) {
-                    continue;
-                }
+                printf("subscribe: recvmsg error: %s\n", ec.message().c_str());
                 break;
             }
             // printf("send_ack for msg %lu\n", msg.id());

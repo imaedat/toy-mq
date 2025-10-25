@@ -242,11 +242,27 @@ std::error_code send_ack(int sockfd, uint64_t msgid)
     auto* hdr = fill_header(msg, command::ack, msgsz);
     *(uint64_t*)hdr->payload = htobe64(msgid);
 
-    std::error_code ec;
-    if (::send(sockfd, hdr, msgsz, MSG_NOSIGNAL) < 0) {
-        ec = std::error_code(errno, std::generic_category());
+    auto* ptr = (uint8_t*)hdr;
+    long want = msgsz;
+    while (want > 0) {
+        auto nwritten = ::send(sockfd, ptr, want, MSG_NOSIGNAL);
+        if (nwritten < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            return std::error_code(errno, std::generic_category());
+        }
+        if (nwritten == 0) {
+            return std::error_code(ENOENT, std::generic_category());
+        }
+        ptr += nwritten;
+        want -= nwritten;
     }
-    return ec;
+    assert(want == 0);
+    return std::error_code();
 }
 }  // namespace helper
 

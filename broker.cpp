@@ -71,6 +71,8 @@ class publisher : public client
     {
     }
 
+    bool receive_publish(const message& msg);
+
     bool attach_if_detached()
     {
         bool expected = true;
@@ -304,7 +306,7 @@ class broker
     bool handle_signal()
     {
         auto sig = signalfd_.get_last_signal();
-        logger_.info("broker: receive signal %d", sig);
+        logger_.info("broker: receive SIG%s", sigabbrev_np(sig));
         switch (sig) {
         case SIGHUP: {
             // XXX
@@ -353,13 +355,15 @@ class broker
             return;
         }
 
-        case command::publish: {
+        case command::publish:
+        case command::publish_ack: {
             logger_.info("broker: accept new publisher (fd=%d)", sockfd);
             std::unique_lock<decltype(mtx_clients_)> lk(mtx_clients_);
-            publishers_.emplace(sockfd, std::make_unique<publisher>(*this, logger_, sock));
+            auto [it, _] =
+                publishers_.emplace(sockfd, std::make_unique<publisher>(*this, logger_, sock));
             lk.unlock();
             epollfd_.add(sockfd);
-            enqueue_deliver(msg, sockfd);
+            it->second->receive_publish(msg);
             break;
         }
 
@@ -861,29 +865,42 @@ bool publisher::dispatch(const message& msg)
     switch (msg.command()) {
     case command::publish:
     case command::publish_ack: {
-        bool requires_ack = msg.command() == command::publish_ack;
-        logger_.debug("%s: publish%s for [%s]", role(), requires_ack ? " (w/ ack)" : "",
-                      msg.topic().data());
-        auto [ok, msgid] = broker_.enqueue_deliver(msg, *sock_);
-        if (!ok) {
-            if (requires_ack) {
-                helper::sendmsg(*sock_, command::nack);
-            }
-            logger_.warn("%s: detach for backpressure", role());
-            broker_.detach_publisher(*sock_);
-            detached_ = true;
-            return false;
-        }
-        if (requires_ack) {
-            helper::send_ack(*sock_, msgid);
-        }
-        break;
+        return receive_publish(msg);
     }
 
     default:
         logger_.error("%s: unexpected command [%x]", role(), (uint8_t)msg.command());
         broker_.close_client(sock_);
         return false;
+    }
+
+    return true;
+}
+
+// main
+bool publisher::receive_publish(const message& msg)
+{
+    bool requires_ack = msg.command() == command::publish_ack;
+    logger_.debug("%s: publish%s for [%s]", role(), requires_ack ? " (w/ ack)" : "",
+                  msg.topic().data());
+    auto [ok, msgid] = broker_.enqueue_deliver(msg, *sock_);
+    if (!ok) {
+        if (requires_ack) {
+            helper::sendmsg(*sock_, command::nack);
+        }
+        logger_.warn("%s: detach for backpressure", role());
+        broker_.detach_publisher(*sock_);
+        detached_ = true;
+        return false;
+    }
+    if (requires_ack) {
+        auto ec = helper::send_ack(*sock_, msgid);
+        if (ec) {
+            logger_.error("%s: send ack error: %s", role(), ec.message().c_str());
+            broker_.close_client(sock_);
+            return false;
+        }
+        logger_.debug("%s: send back ack for msg %lu", role(), msgid);
     }
 
     return true;
