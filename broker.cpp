@@ -178,6 +178,97 @@ class subscriber
 };
 
 /****************************************************************************
+ * ack reactor
+ */
+class reactor
+{
+  public:
+    reactor(const config& c, broker& b, logger& l, size_t i)
+        : cfg_(c)
+        , broker_(b)
+        , logger_(l)
+        , name_("reactor-"s + std::to_string(i))
+    {
+        epollfd_.add(eventfd_);
+        thr_ = std::thread([this] { loop(); });
+    }
+
+    ~reactor()
+    {
+        stop();
+        join_thread(thr_);
+    }
+
+    void stop()
+    {
+        eventfd_.write();
+    }
+
+    // main
+    auto delegate(io_socket& sock, std::string_view topic)
+    {
+        int sockfd = *sock;
+        logger_.debug("%s: delegated subscriber %d", name(), sockfd);
+        std::unique_lock<decltype(mtx_)> lk(mtx_);
+        auto [it, _] = subscribers_.emplace(
+            sockfd, std::make_shared<subscriber>(broker_, logger_, sock, topic));
+        lk.unlock();
+        epollfd_.add(sockfd);
+        return it->second;
+    }
+
+    // reactor, worker
+    void notify_close(int sockfd)
+    {
+        logger_.debug("%s: close subscriber %d", name(), sockfd);
+        std::unique_lock<decltype(mtx_)> lk(mtx_);  // XXX
+        epollfd_.del(sockfd);
+        subscribers_.erase(sockfd);
+    }
+
+  private:
+    const config cfg_;
+    broker& broker_;
+    logger& logger_;
+    std::string name_;
+    tbd::epollfd epollfd_;
+    tbd::eventfd eventfd_;
+    std::unordered_map<int, std::shared_ptr<subscriber>> subscribers_;
+    std::thread thr_;
+    std::mutex mtx_;
+
+    const char* name() const noexcept
+    {
+        return name_.c_str();
+    }
+
+    void loop()
+    {
+        // const auto sub_max = cfg_.get<int>("subscribe_maxiters", DEFAULT_SUBSCRIBE_MAXITERS);
+
+        while (true) {
+            auto events = epollfd_.wait();
+            for (const auto& ev : events) {
+                if (ev.fd == *eventfd_) {
+                    return;
+                }
+
+                std::unique_lock<decltype(mtx_)> lk(mtx_);
+                auto it = subscribers_.find(ev.fd);
+                if (it == subscribers_.end()) {
+                    logger_.warn("%s: subscriber %d already closed", name(), ev.fd);
+                    epollfd_.del(ev.fd);
+                    continue;
+                }
+
+                lk.unlock();
+                it->second->handle(ev.events);
+            }
+        }
+    }
+};
+
+/****************************************************************************
  * broker
  */
 class broker
@@ -243,14 +334,6 @@ class broker
         std::vector<std::weak_ptr<subscriber>> snap;
         std::chrono::steady_clock::time_point last_snapped_;
     };
-    struct reactor
-    {
-        std::thread thr;
-        tbd::epollfd epollfd;
-        tbd::eventfd eventfd;
-        std::unordered_map<int, std::weak_ptr<subscriber>> subscribers;
-        std::mutex mtx;
-    };
     struct metrics
     {
         // rate
@@ -279,7 +362,7 @@ class broker
     std::atomic<std::chrono::steady_clock::time_point> sub_last_updated_;
     // ack reactor
     size_t nreactors_;
-    std::vector<reactor> reactors_;
+    std::vector<std::unique_ptr<reactor>> reactors_;
     // keeper
     std::thread keeper_;
     tbd::eventfd ev_keeper_;
@@ -293,7 +376,7 @@ class broker
     // { fd => client }
     std::unordered_map<int, std::unique_ptr<publisher>> publishers_;
     std::shared_mutex mtx_pubs_;
-    std::unordered_map<int, std::shared_ptr<subscriber>> subscribers_;
+    std::unordered_map<int, std::weak_ptr<subscriber>> subscribers_;
     std::shared_mutex mtx_subs_;
 
     // { msgid => { msg, expiry, subscribers } }
@@ -398,13 +481,11 @@ class broker
         }
 
         case command::subscribe: {
+            auto sub = reactors_[sockfd % nreactors_]->delegate(sock, msg.topic());
+            std::lock_guard<decltype(mtx_subs_)> lk(mtx_subs_);
+            auto [it, _] = subscribers_.emplace(sockfd, sub);
             logger_.info("broker: accept new subscriber [%s] (fd=%d)", msg.topic().data(), sockfd);
-            std::unique_lock<decltype(mtx_subs_)> lk(mtx_subs_);
-            auto [it, _] = subscribers_.emplace(
-                sockfd, std::make_shared<subscriber>(*this, logger_, sock, msg.topic()));
-            lk.unlock();
-            sub_last_updated_ = steady_clock::now();
-            delegate_subscriber(it->second);
+            thrpool_.submit([this, sub_wp = it->second] { redeliver(sub_wp); });
             break;
         }
 
@@ -412,21 +493,6 @@ class broker
             break;
         }
         logger_.flush();
-    }
-
-    void delegate_subscriber(const std::shared_ptr<subscriber>& sub)
-    {
-        auto& sock = sub->socket();
-        sock.set_nonblock(false);
-        auto sockfd = *sock;
-        auto& r = reactors_[sockfd % nreactors_];
-
-        std::unique_lock<decltype(r.mtx)> lk(r.mtx);
-        auto [it, _] = r.subscribers.emplace(sockfd, sub);
-        lk.unlock();
-
-        r.epollfd.add(sockfd);
-        thrpool_.submit([this, sub_wp = it->second] { redeliver(sub_wp); });
     }
 
     // worker
@@ -469,7 +535,7 @@ class broker
             routers_[i].thr = std::thread([this, i] { msg_router(i); });
         }
         for (size_t i = 0; i < nreactors_; ++i) {
-            reactors_[i].thr = std::thread([this, i] { sub_reactor(i); });
+            reactors_[i] = std::make_unique<reactor>(cfg_, *this, logger_, i);
         }
         keeper_ = std::thread([this] { house_keeper(); });
         sampler_ = std::thread([this] { sampler(); });
@@ -479,12 +545,11 @@ class broker
     {
         running_ = false;
         std::for_each(routers_.begin(), routers_.end(), [](auto&& r) { r.cv.notify_one(); });
-        std::for_each(reactors_.begin(), reactors_.end(), [](auto&& r) { r.eventfd.write(); });
+        std::for_each(reactors_.begin(), reactors_.end(), [](auto&& r) { r->stop(); });
         ev_keeper_.write();
         ev_sampler_.write();
 
         std::for_each(routers_.begin(), routers_.end(), [this](auto&& r) { join_thread(r.thr); });
-        std::for_each(reactors_.begin(), reactors_.end(), [this](auto&& r) { join_thread(r.thr); });
         join_thread(keeper_);
         join_thread(sampler_);
     }
@@ -568,43 +633,6 @@ class broker
         }
     }
 
-    void sub_reactor(size_t i)
-    {
-        const auto sub_max = cfg_.get<int>("subscribe_maxiters", DEFAULT_SUBSCRIBE_MAXITERS);
-
-        auto& r = reactors_[i];
-        r.epollfd.add(r.eventfd);
-
-        while (true) {
-            auto events = r.epollfd.wait();
-            for (const auto& ev : events) {
-                if (ev.fd == *r.eventfd) {
-                    return;
-                }
-
-                std::unique_lock<decltype(r.mtx)> lk(r.mtx);
-                auto it = r.subscribers.find(ev.fd);
-                if (it == r.subscribers.end()) {
-                    logger_.warn("reactor-%lu: subscriber %d already closed", i, ev.fd);
-                    r.epollfd.del(ev.fd);
-                    continue;
-                }
-
-                auto sub = it->second.lock();
-                if (!sub) {
-                    logger_.warn("reactor-%lu: subscriber %d already expired", i, ev.fd);
-                    std::error_code ec;
-                    r.epollfd.del(ev.fd, ec);
-                    r.subscribers.erase(ev.fd);
-                    continue;
-                }
-
-                lk.unlock();
-                sub->handle(ev.events, sub_max);
-            }
-        }
-    }
-
     void house_keeper()
     {
         tbd::poll poller(ev_keeper_);
@@ -681,21 +709,12 @@ class broker
             }
 
         } else if (role == role::subscriber) {
+            reactors_[sockfd % nreactors_]->notify_close(sockfd);
             std::lock_guard<decltype(mtx_subs_)> lks(mtx_subs_);
-            auto jt = subscribers_.find(sockfd);
-            if (jt != subscribers_.end()) {
-                subscribers_.erase(sockfd);
-                sub_last_updated_ = steady_clock::now();
-
-                auto& r = reactors_[sockfd % nreactors_];
-                std::lock_guard<decltype(r.mtx)> lkr(r.mtx);
-                std::error_code ec;
-                r.epollfd.del(sockfd, ec);
-                r.subscribers.erase(sockfd);
-
-                logger_.info("broker: close subscriber (fd=%d)", sockfd);
-                logger_.flush();
-            }
+            subscribers_.erase(sockfd);
+            sub_last_updated_ = steady_clock::now();
+            logger_.info("broker: close subscriber (fd=%d)", sockfd);
+            logger_.flush();
 
         } else {
             assert(false);
