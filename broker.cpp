@@ -19,12 +19,28 @@
 #include "socket.hpp"
 #include "thread_pool.hpp"
 
-using namespace tbd;
 using namespace std::chrono;
+using namespace std::string_literals;
+using namespace tbd;
 
 namespace toymq {
 
+namespace {
+void join_thread(std::thread& thr)
+{
+    if (thr.joinable()) {
+        thr.join();
+    }
+}
+}  // namespace
+
 class broker;
+
+enum class role : uint8_t
+{
+    publisher = 1,
+    subscriber,
+};
 
 /****************************************************************************
  * client
@@ -33,29 +49,36 @@ class client
 {
   public:
     virtual ~client() noexcept = default;
-    void handle(uint32_t, int);
+    void handle(uint32_t events, int max_iters = 0);
     io_socket& socket() noexcept
     {
         return sock_;
+    }
+
+    toymq::role role() const noexcept
+    {
+        return role_;
+    }
+
+    const char* name() const noexcept
+    {
+        return name_.c_str();
     }
 
   protected:
     broker& broker_;
     logger& logger_;
     io_socket sock_;
-    std::string role_;
+    toymq::role role_;
+    std::string name_;
 
-    client(broker& b, logger& l, io_socket& s, const std::string& role) noexcept
+    client(broker& b, logger& l, io_socket& s, toymq::role r) noexcept
         : broker_(b)
         , logger_(l)
         , sock_(std::move(s))
-        , role_(role + "-" + std::to_string(*sock_))
+        , role_(r)
+        , name_((r == role::publisher ? "pub"s : "sub"s) + "-" + std::to_string(*sock_))
     {
-    }
-
-    const char* role() const noexcept
-    {
-        return role_.c_str();
     }
 
     virtual bool dispatch(const message& msg) = 0;
@@ -68,7 +91,7 @@ class publisher : public client
 {
   public:
     publisher(broker& b, logger& l, io_socket& s)
-        : client(b, l, s, "pub")
+        : client(b, l, s, role::publisher)
     {
     }
 
@@ -95,9 +118,11 @@ class subscriber
 {
   public:
     subscriber(broker& b, logger& l, io_socket& s, std::string_view t)
-        : client(b, l, s, "sub")
+        : client(b, l, s, role::subscriber)
         , topic_(t)
     {
+        sock_.set_nonblock(false);
+
         if (topic_ == "*") {
             topic_.clear();
         } else {
@@ -120,7 +145,7 @@ class subscriber
             match = (pos == 0 && (msg_topic.size() == topic_.size() || topic_.back() == '.'));
         }
 
-        logger_.debug("%s: my topic [%s], msg topic [%s] => match=%s", role(), topic_.c_str(),
+        logger_.debug("%s: my topic [%s], msg topic [%s] => match=%s", name(), topic_.c_str(),
                       msg_topic.data(), match ? "true" : "false");
         return match;
     }
@@ -128,16 +153,14 @@ class subscriber
     void push(const std::shared_ptr<message>& msg);
     void flush();
 
-    void ack_arrived(uint64_t msgid, bool fastpath)
+    // reactor or worker
+    void ack_arrived(uint64_t msgid)
     {
-        if (fastpath) {
-            unacked_msgs_.erase(msgid);  // O(1)
-        } else {
-            std::lock_guard<decltype(mtx_)> lk(mtx_);
-            unacked_msgs_.erase(msgid);
-        }
+        std::lock_guard<decltype(mtx_)> lk(mtx_);
+        unacked_msgs_.erase(msgid);  // O(1)
     }
 
+    // reactor
     std::unordered_set<uint64_t> unacked_msgs()
     {
         std::lock_guard<decltype(mtx_)> lk(mtx_);
@@ -149,6 +172,7 @@ class subscriber
     std::mutex mtx_;
     std::deque<std::shared_ptr<message>> drainq_;
     std::unordered_set<uint64_t> unacked_msgs_;
+    std::atomic<bool> leaving_{false};
 
     bool dispatch(const message& msg) override;
 };
@@ -363,12 +387,12 @@ class broker
 
         case command::publish:
         case command::publish_ack: {
-            logger_.info("broker: accept new publisher (fd=%d)", sockfd);
             std::unique_lock<decltype(mtx_pubs_)> lk(mtx_pubs_);
             auto [it, _] =
                 publishers_.emplace(sockfd, std::make_unique<publisher>(*this, logger_, sock));
             lk.unlock();
             epollfd_.add(sockfd);
+            logger_.info("broker: accept new publisher (fd=%d)", sockfd);
             it->second->receive_publish(msg);
             break;
         }
@@ -463,13 +487,6 @@ class broker
         std::for_each(reactors_.begin(), reactors_.end(), [this](auto&& r) { join_thread(r.thr); });
         join_thread(keeper_);
         join_thread(sampler_);
-    }
-
-    void join_thread(std::thread& thr)
-    {
-        if (thr.joinable()) {
-            thr.join();
-        }
     }
 
     void msg_router(size_t i)
@@ -647,27 +664,23 @@ class broker
      * from clients
      */
   public:
-    // main, worker
-    void close_client(io_socket& sock)
+    // pub:main, sub:reactor(handle), sub:worker(flush, unsubscribe)
+    void close_client(role role, io_socket& sock)
     {
         int sockfd = *sock;
-        std::error_code ec;
-        epollfd_.del(sockfd, ec);
-        sock.close();
 
-        // try publishers_
-        {
+        if (role == role::publisher) {
             std::lock_guard<decltype(mtx_pubs_)> lkp(mtx_pubs_);
             auto it = publishers_.find(sockfd);
             if (it != publishers_.end()) {
+                epollfd_.del(sockfd);
+                sock.close();
                 publishers_.erase(it);
                 logger_.info("broker: close publisher (fd=%d)", sockfd);
                 logger_.flush();
-                return;
             }
-        }
-        // then subscribers_
-        {
+
+        } else if (role == role::subscriber) {
             std::lock_guard<decltype(mtx_subs_)> lks(mtx_subs_);
             auto jt = subscribers_.find(sockfd);
             if (jt != subscribers_.end()) {
@@ -683,6 +696,9 @@ class broker
                 logger_.info("broker: close subscriber (fd=%d)", sockfd);
                 logger_.flush();
             }
+
+        } else {
+            assert(false);
         }
     }
 
@@ -775,29 +791,28 @@ class broker
         std::unique_lock<decltype(mtx_unack_)> lk(mtx_unack_, std::defer_lock);
         if (lk.try_lock()) {
             // inline path
-            collect_unack(std::move(sub_wp), msgid, true);
+            collect_unack(std::move(sub_wp), msgid, "reactor");
 
         } else {
             // later ...
             thrpool_.submit([this, sub_wp = std::move(sub_wp), msgid]() mutable {
                 std::lock_guard<decltype(mtx_unack_)> lk(mtx_unack_);
-                collect_unack(std::move(sub_wp), msgid, false);
+                collect_unack(std::move(sub_wp), msgid, "worker");
             });
         }
     }
 
+  private:
     // reactor or worker
-    void collect_unack(std::weak_ptr<subscriber>&& sub_wp, uint64_t msgid, bool fastpath)
+    void collect_unack(std::weak_ptr<subscriber>&& sub_wp, uint64_t msgid, std::string_view caller)
     {
-        const auto& role = fastpath ? "reactor" : "worker";
-
         if (auto sub = sub_wp.lock()) {
-            sub->ack_arrived(msgid, fastpath);
+            sub->ack_arrived(msgid);
         }
 
         auto it = unacked_msgs_.find(msgid);  // O(log n)
         if (it == unacked_msgs_.end()) {
-            logger_.warn("%s: unacked msg %lu removed ???", role, msgid);
+            logger_.warn("%s: unacked msg %lu removed ???", caller.data(), msgid);
             return;
         }
 
@@ -805,31 +820,34 @@ class broker
         if (it->second.subscribers.empty()) {
             unacked_msgs_.erase(it);  // O(1)
             metrics_.unacked.fetch_sub(1, std::memory_order_relaxed);
-            logger_.debug("%s: all subs sent ack for msg %lu", role, msgid);
+            logger_.debug("%s: all subs sent ack for msg %lu", caller.data(), msgid);
             try_attach();
         }
     }
 
-    // reactor
-    void unsubscribe(std::weak_ptr<subscriber>&& sub_wp)
+  public:
+    // reactor -> worker
+    void enqueue_leave(std::weak_ptr<subscriber>&& sub_wp)
     {
-        if (auto sub = sub_wp.lock()) {
-            std::lock_guard<decltype(mtx_unack_)> lk(mtx_unack_);
-            const auto& msgs = sub->unacked_msgs();
-            for (const auto& msgid : msgs) {          // O(n)
-                auto it = unacked_msgs_.find(msgid);  // O(log n)
-                if (it != unacked_msgs_.end()) {
-                    it->second.subscribers.erase(sub_wp);  // O(log n)
-                    if (it->second.subscribers.empty()) {
-                        unacked_msgs_.erase(it);
-                        metrics_.unacked.fetch_sub(1, std::memory_order_relaxed);
-                        try_attach();
+        thrpool_.submit([this, sub_wp = std::move(sub_wp)] {
+            if (auto sub = sub_wp.lock()) {
+                std::lock_guard<decltype(mtx_unack_)> lk(mtx_unack_);
+                const auto& msgs = sub->unacked_msgs();
+                for (const auto& msgid : msgs) {          // O(n)
+                    auto it = unacked_msgs_.find(msgid);  // O(log n)
+                    if (it != unacked_msgs_.end()) {
+                        it->second.subscribers.erase(sub_wp);  // O(log n)
+                        if (it->second.subscribers.empty()) {
+                            unacked_msgs_.erase(it);
+                            metrics_.unacked.fetch_sub(1, std::memory_order_relaxed);
+                            try_attach();
+                        }
                     }
                 }
-            }
 
-            close_client(sub->socket());
-        }
+                close_client(role::subscriber, sub->socket());
+            }
+        });
     }
 
     // router
@@ -855,8 +873,8 @@ class broker
 void client::handle(uint32_t events, int max_iters)
 {
     if (!(events & EPOLLIN) && (events & (EPOLLRDHUP | EPOLLERR | EPOLLHUP))) {
-        logger_.error("%s: client socket error, event bits = %08x", role(), events);
-        broker_.close_client(sock_);
+        logger_.error("%s: client socket error, event bits = %08x", name(), events);
+        broker_.close_client(role(), sock_);
         return;
     }
 
@@ -867,17 +885,17 @@ void client::handle(uint32_t events, int max_iters)
                 return;
             }
             if (ec.value() == ENOENT) {
-                logger_.info("%s: Connection closed by peer", role());
+                logger_.info("%s: Connection closed by peer", name());
             } else {
-                logger_.error("%s: recv error: %s", role(), ec.message().c_str());
+                logger_.error("%s: recv error: %s", name(), ec.message().c_str());
             }
-            broker_.close_client(sock_);
+            broker_.close_client(role(), sock_);
             return;
         }
 
         if (msg.command() == command::close) {
-            logger_.info("%s: close", role());
-            broker_.close_client(sock_);
+            logger_.info("%s: close", name());
+            broker_.close_client(role(), sock_);
             return;
         }
 
@@ -897,8 +915,8 @@ bool publisher::dispatch(const message& msg)
     }
 
     default:
-        logger_.error("%s: unexpected command [%x]", role(), (uint8_t)msg.command());
-        broker_.close_client(sock_);
+        logger_.error("%s: unexpected command [%x]", name(), (uint8_t)msg.command());
+        broker_.close_client(role(), sock_);
         return false;
     }
 
@@ -909,14 +927,14 @@ bool publisher::dispatch(const message& msg)
 bool publisher::receive_publish(const message& msg)
 {
     bool requires_ack = msg.command() == command::publish_ack;
-    logger_.debug("%s: publish%s for [%s]", role(), requires_ack ? " (w/ ack)" : "",
+    logger_.debug("%s: publish%s for [%s]", name(), requires_ack ? " (w/ ack)" : "",
                   msg.topic().data());
     auto [ok, msgid] = broker_.enqueue_deliver(msg, *sock_);
     if (!ok) {
         if (requires_ack) {
             helper::sendmsg(*sock_, command::nack);
         }
-        logger_.warn("%s: detach for backpressure", role());
+        logger_.warn("%s: detach for backpressure", name());
         broker_.detach_publisher(*sock_);
         detached_ = true;
         return false;
@@ -924,11 +942,11 @@ bool publisher::receive_publish(const message& msg)
     if (requires_ack) {
         auto ec = helper::send_ack(*sock_, msgid);
         if (ec) {
-            logger_.error("%s: send ack error: %s", role(), ec.message().c_str());
-            broker_.close_client(sock_);
+            logger_.error("%s: send ack error: %s", name(), ec.message().c_str());
+            broker_.close_client(role(), sock_);
             return false;
         }
-        logger_.debug("%s: send back ack for msg %lu", role(), msgid);
+        logger_.debug("%s: send back ack for msg %lu", name(), msgid);
     }
 
     return true;
@@ -939,18 +957,19 @@ bool subscriber::dispatch(const message& msg)
 {
     switch (msg.command()) {
     case command::ack:
-        logger_.debug("%s: ack for msg %lu", role(), msg.id());
+        logger_.debug("%s: ack for msg %lu", name(), msg.id());
         broker_.receive_ack(weak_from_this(), msg);
         break;
 
     case command::unsubscribe:
-        logger_.info("%s: unsubscribe", role());
-        broker_.unsubscribe(weak_from_this());
+        logger_.info("%s: unsubscribe", name());
+        leaving_ = true;
+        broker_.enqueue_leave(weak_from_this());
         return false;
 
     default:
-        logger_.error("%s: unexpected command [%x]", role(), (uint8_t)msg.command());
-        broker_.close_client(sock_);
+        logger_.error("%s: unexpected command [%x]", name(), (uint8_t)msg.command());
+        broker_.close_client(role(), sock_);
         return false;
     }
 
@@ -960,10 +979,12 @@ bool subscriber::dispatch(const message& msg)
 // router
 void subscriber::push(const std::shared_ptr<message>& msg)
 {
-    std::lock_guard<decltype(mtx_)> lk(mtx_);
-    unacked_msgs_.emplace(msg->id());
-    drainq_.emplace_back(msg);
-    broker_.enqueue_flush(weak_from_this());
+    if (!leaving_) {
+        std::lock_guard<decltype(mtx_)> lk(mtx_);
+        unacked_msgs_.emplace(msg->id());
+        drainq_.emplace_back(msg);
+        broker_.enqueue_flush(weak_from_this());
+    }
 }
 
 // worker
@@ -983,13 +1004,13 @@ void subscriber::flush()
         msg.msg_iovlen = iovcnt;
 
         if (::sendmsg(*sock_, &msg, MSG_NOSIGNAL) < 0) {
-            logger_.error("%s: sendmsg error (count %lu): %s", role(), iovcnt, strerror(errno));
-            broker_.close_client(sock_);
+            logger_.error("%s: sendmsg error (count %lu): %s", name(), iovcnt, strerror(errno));
+            broker_.close_client(role(), sock_);
             return;
         }
         drainq_.erase(drainq_.begin(), it);
         broker_.on_emit(iovcnt);
-        logger_.debug("%s: flush %lu msgs", role(), iovcnt);
+        logger_.debug("%s: flush %lu msgs", name(), iovcnt);
     }
 }
 
