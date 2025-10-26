@@ -3,6 +3,10 @@
 
 #include "proto.hpp"
 
+#include <uuid/uuid.h>
+
+#include <fstream>
+
 #include "socket.hpp"
 
 namespace toymq {
@@ -62,9 +66,16 @@ class subscriber
     };
 
   public:
-    subscriber(std::string_view ipaddr, uint16_t port)
+    inline static const std::string DEFAULT_CLIENTID_FILE{".subscriber_id"};
+
+    subscriber(std::string_view ipaddr, uint16_t port, std::string_view client_id = "")
         : sock_(ipaddr, port)
     {
+        if (setup_client_id(client_id)) {
+            save_client_id();
+        }
+
+        printf("subscriber id = %s\n", uuid_.c_str());
         sock_.set_nonblock(false);
     }
 
@@ -74,7 +85,7 @@ class subscriber
         sock_.connect();
         auto [_, lport] = sock_.local_endpoint();
         printf("subscriber: localport = %u\n", lport);
-        helper::sendmsg(*sock_, command::subscribe, topic);
+        helper::sendmsg(*sock_, command::subscribe, topic, uuid_.data(), 37);
 
         while (true) {
             auto [msg, ec] = helper::recvmsg(*sock_, true);
@@ -101,6 +112,50 @@ class subscriber
 
   private:
     tbd::tcp_client sock_;
+    std::string uuid_;
+
+    // @return save to file?
+    bool setup_client_id(std::string_view id_arg)
+    {
+        uuid_t uuid_bin;
+
+        // from argument
+        if (!id_arg.empty()) {
+            if (::uuid_parse(id_arg.data(), uuid_bin) < 0) {
+                throw std::invalid_argument("invalid client id from argument. retry another one.");
+            }
+            uuid_ = id_arg;
+            return true;
+        }
+
+        // from dot file
+        std::ifstream ifs(DEFAULT_CLIENTID_FILE);
+        if (ifs) {
+            std::string id_file;
+            std::getline(ifs, id_file);
+            if (id_file.empty() || ::uuid_parse(id_file.data(), uuid_bin) < 0) {
+                throw std::invalid_argument("invalid client id in file. remove it.");
+            }
+            uuid_ = std::move(id_file);
+            return false;
+        }
+        ifs.close();
+
+        // else: generate new one
+        ::uuid_generate(uuid_bin);
+        uuid_.reserve(37);
+        uuid_.resize(36);
+        ::uuid_unparse_lower(uuid_bin, uuid_.data());
+        return true;
+    }
+
+    void save_client_id()
+    {
+        std::ofstream ofs(DEFAULT_CLIENTID_FILE);
+        if (ofs) {
+            ofs << uuid_ << "\n";
+        }
+    }
 };
 
 }  // namespace toymq

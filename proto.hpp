@@ -11,9 +11,6 @@
 #include <system_error>
 #include <vector>
 
-// XXX
-#include "hexdump.h"
-
 namespace toymq {
 
 static constexpr uint8_t VERSION = 1;

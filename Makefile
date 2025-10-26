@@ -1,7 +1,7 @@
 CXX := g++
 CXXFLAGS += -std=c++17 -Wall -Wextra -g -O2
 CPPFLAGS += -I../cpp-libs
-LDFLAGS +=
+LDFLAGS += -luuid
 LDLIBS += -pthread
 
 ASAN ?= 0
