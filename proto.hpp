@@ -47,10 +47,12 @@ struct message
         : buf(sizeof(header), 0)
     {
     }
+    // copy `publish` msg to `push` msg w/ msgid
     message(const message& orig, uint64_t msgid)
         : message(orig)
     {
         resize(length() + sizeof(msgid));
+        hdr()->command = (uint8_t)command::push;
         id(msgid);
     }
 

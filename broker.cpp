@@ -29,6 +29,49 @@ using namespace tbd;
 namespace toymq {
 
 namespace {
+
+struct string_like_hash
+{
+    using is_transparent = void;
+    size_t operator()(const std::string& s) const noexcept
+    {
+        return std::hash<std::string>{}(s);
+    }
+    size_t operator()(std::string_view sv) const noexcept
+    {
+        return std::hash<std::string_view>{}(sv);
+    }
+    size_t operator()(const char* s) const noexcept
+    {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+
+struct string_like_equal
+{
+    using is_transparent = void;
+    bool operator()(const std::string& s1, const std::string& s2) const noexcept
+    {
+        return s1 == s2;
+    }
+    bool operator()(const std::string& s1, std::string_view s2) const noexcept
+    {
+        return s1 == s2;
+    }
+    bool operator()(std::string_view s1, const std::string& s2) const noexcept
+    {
+        return s1 == s2;
+    }
+    bool operator()(const std::string& s1, const char* s2) const noexcept
+    {
+        return s1 == s2;
+    }
+    bool operator()(const char* s1, const std::string& s2) const noexcept
+    {
+        return s1 == s2;
+    }
+};
+
 void join_thread(std::thread& thr)
 {
     if (likely(thr.joinable())) {
@@ -120,7 +163,7 @@ class subscriber
     , public std::enable_shared_from_this<subscriber>
 {
   public:
-    subscriber(broker& b, logger& l, io_socket& s, std::string_view t, const char* uuid)
+    subscriber(broker& b, logger& l, io_socket& s, std::string_view t, std::string_view uuid)
         : client(b, l, s, role::subscriber)
         , topic_(t)
         , client_id_(uuid)
@@ -209,20 +252,25 @@ class reactor
         join_thread(thr_);
     }
 
-    void stop()
+    void stop() const
     {
         eventfd_.write();
     }
 
     // main
-    auto delegate(io_socket& sock, const message& msg)
+    std::shared_ptr<subscriber> delegate(io_socket& sock, const message& msg)
     {
         int sockfd = *sock;
         logger_.debug("%s: delegated subscriber %d", name(), sockfd);
+        std::string_view subid((const char*)msg.data());
         std::unique_lock<decltype(mtx_)> lk(mtx_);
+        if (unlikely(subscriber_ids_.find(subid.data()) != subscriber_ids_.end())) {
+            logger_.error("%s: subscriber id %s is already active, reject it", name(), subid);
+            return nullptr;
+        }
         auto [it, _] = subscribers_.emplace(
-            sockfd, std::make_shared<subscriber>(broker_, logger_, sock, msg.topic(),
-                                                 (const char*)msg.data()));
+            sockfd, std::make_shared<subscriber>(broker_, logger_, sock, msg.topic(), subid));
+        subscriber_ids_.emplace(subid);
         lk.unlock();
         epollfd_.add(sockfd);
         return it->second;
@@ -239,7 +287,11 @@ class reactor
         }
 
         logger_.debug("%s: close subscriber %d", name(), sockfd);
-        subscribers_.erase(sockfd);  // dtor -> close socket
+        auto it = subscribers_.find(sockfd);
+        if (likely(it != subscribers_.end())) {
+            subscriber_ids_.erase(it->second->client_id());
+            subscribers_.erase(it);  // dtor -> close socket
+        }
         return true;
     }
 
@@ -251,6 +303,7 @@ class reactor
     tbd::epollfd epollfd_;
     tbd::eventfd eventfd_;
     std::unordered_map<int, std::shared_ptr<subscriber>> subscribers_;
+    std::unordered_set<std::string, string_like_hash, string_like_equal> subscriber_ids_;
     std::thread thr_;
     std::mutex mtx_;
 
@@ -561,11 +614,15 @@ class broker
 
         case command::subscribe: {
             auto sub = reactors_[sockfd % nreactors_]->delegate(sock, msg);
-            std::lock_guard<decltype(mtx_subs_)> lk(mtx_subs_);
-            auto [it, _] = subscribers_.emplace(sockfd, sub);
-            logger_.info("broker: accept new subscriber %s [%s] (fd=%d)", sub->client_id().c_str(),
-                         msg.topic().data(), sockfd);
-            thrpool_.submit([this, sub_wp = it->second] { redeliver(sub_wp); });
+            if (likely(sub)) {
+                std::lock_guard<decltype(mtx_subs_)> lk(mtx_subs_);
+                auto [it, _] = subscribers_.emplace(sockfd, sub);
+                logger_.info("broker: accept new subscriber %s [%s] (fd=%d)",
+                             sub->client_id().c_str(), msg.topic().data(), sockfd);
+                thrpool_.submit([this, sub_wp = it->second] { redeliver(sub_wp); });
+            } else {
+                helper::sendmsg(*sock, command::nack);
+            }
             break;
         }
 

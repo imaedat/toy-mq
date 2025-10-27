@@ -93,6 +93,11 @@ class subscriber
                 printf("subscribe: recvmsg error: %s\n", ec.message().c_str());
                 break;
             }
+            if (msg.command() != command::push) {
+                printf("subscribe: receive not push command (%u), disconnect\n",
+                       (uint8_t)msg.command());
+                break;
+            }
             // printf("send_ack for msg %lu\n", msg.id());
             helper::send_ack(*sock_, msg.id());
 
