@@ -285,6 +285,55 @@ class reactor
 };
 
 /****************************************************************************
+ * periodic thread
+ */
+class periodic_worker
+{
+  public:
+    template <typename F>
+    periodic_worker(int interval_ms, F&& task)
+        : eventfd_()
+        , poller_(eventfd_)
+        , thr_([this, interval_ms, task = std::forward<F>(task)] { loop(interval_ms, task); })
+    {
+    }
+
+    ~periodic_worker()
+    {
+        stop();
+        join_thread(thr_);
+    }
+
+    void stop() const
+    {
+        eventfd_.write();
+    }
+
+  private:
+    tbd::eventfd eventfd_;
+    tbd::poll poller_;
+    std::thread thr_;
+
+    template <typename F>
+    void loop(int interval_ms, F&& task) const
+    {
+        int wait_ms = interval_ms;
+        while (true) {
+            const auto& evs = poller_.wait(wait_ms);
+            auto t = steady_clock::now();
+            if (unlikely(!evs.empty())) {
+                break;
+            }
+
+            task();
+
+            auto elapsed_ms = duration_cast<milliseconds>(steady_clock::now() - t).count();
+            wait_ms = std::max((int)(interval_ms - elapsed_ms), 0);
+        }
+    }
+};
+
+/****************************************************************************
  * broker
  */
 class broker
@@ -310,11 +359,15 @@ class broker
         , logger_(cfg_.get<std::string>("log_procname", "broker"),
                   cfg_.get<std::string>("log_filepath", "broker.log"))
         , running_(true)
-        , nrouters_(cfg.get<int>("router_threads", DEFAULT_ROUTERS))
-        , routers_(nrouters_)
+        , sampler_(cfg_.get<int>("sampler_interval_sec", DEFAULT_SAMPLER_INTERVAL) * 1000,
+                   [this] { sampling(); })
+        , keeper_(cfg_.get<int>("keeper_interval_sec", DEFAULT_KEEPER_INTERVAL) * 1000,
+                  [this] { clean_expired_msg(); })
+        , thrpool_(cfg_.get<int>("worker_threads", DEFAULT_WORKERS))
         , nreactors_(cfg_.get<int>("reactor_threads", DEFAULT_REACTORS))
         , reactors_(nreactors_)
-        , thrpool_(cfg_.get<int>("worker_threads", DEFAULT_WORKERS))
+        , nrouters_(cfg.get<int>("router_threads", DEFAULT_ROUTERS))
+        , routers_(nrouters_)
     {
         logger_.set_level(cfg_.get<std::string>("log_level", "info"));
         start_residents();
@@ -386,22 +439,20 @@ class broker
     std::map<uint64_t, unacked_msg> unacked_msgs_;
     std::mutex mtx_unack_;
 
+    // metrics sampler
+    metrics metrics_;
+    periodic_worker sampler_;
+    // house keeper
+    periodic_worker keeper_;
+    // generic worker
+    thread_pool thrpool_;
+    // ack reactor
+    size_t nreactors_;
+    std::vector<std::unique_ptr<reactor>> reactors_;
     // router
     size_t nrouters_;
     std::vector<router> routers_;
     std::atomic<std::chrono::steady_clock::time_point> sub_last_updated_;
-    // ack reactor
-    size_t nreactors_;
-    std::vector<std::unique_ptr<reactor>> reactors_;
-    // keeper
-    std::thread keeper_;
-    tbd::eventfd ev_keeper_;
-    // sampler
-    std::thread sampler_;
-    tbd::eventfd ev_sampler_;
-    metrics metrics_;
-    // generic worker
-    thread_pool thrpool_;
 
     // main
     bool run_one()
@@ -561,15 +612,13 @@ class broker
      */
     void start_residents()
     {
+        for (size_t i = 0; i < nreactors_; ++i) {
+            reactors_[i] = std::make_unique<reactor>(cfg_, *this, logger_, i);
+        }
         for (size_t i = 0; i < nrouters_; ++i) {
             routers_[i].i = i;
             routers_[i].thr = std::thread([this, i] { msg_router(i); });
         }
-        for (size_t i = 0; i < nreactors_; ++i) {
-            reactors_[i] = std::make_unique<reactor>(cfg_, *this, logger_, i);
-        }
-        keeper_ = std::thread([this] { house_keeper(); });
-        sampler_ = std::thread([this] { sampler(); });
     }
 
     void stop_residents()
@@ -577,12 +626,10 @@ class broker
         running_ = false;
         std::for_each(routers_.begin(), routers_.end(), [](auto&& r) { r.cv.notify_one(); });
         std::for_each(reactors_.begin(), reactors_.end(), [](auto&& r) { r->stop(); });
-        ev_keeper_.write();
-        ev_sampler_.write();
+        keeper_.stop();
+        sampler_.stop();
 
         std::for_each(routers_.begin(), routers_.end(), [this](auto&& r) { join_thread(r.thr); });
-        join_thread(keeper_);
-        join_thread(sampler_);
     }
 
     void msg_router(size_t i)
@@ -664,69 +711,35 @@ class broker
         }
     }
 
-    void house_keeper()
+    void clean_expired_msg()
     {
-        static const auto interval_ms =
-            cfg_.get<int>("keeper_interval_sec", DEFAULT_KEEPER_INTERVAL) * 1000;
-        int wait_ms = interval_ms;
-
-        tbd::poll poller(ev_keeper_);
-        while (true) {
-            const auto& evs = poller.wait(wait_ms);
-            auto t = steady_clock::now();
-            if (unlikely(!evs.empty())) {
-                return;
+        std::unique_lock<decltype(mtx_unack_)> lk(mtx_unack_);
+        auto now = system_clock::now();
+        auto it = unacked_msgs_.begin();
+        while (it != unacked_msgs_.end()) {  // O(n)
+            if (it->second.expiry > now) {
+                break;
             }
-
-            {
-                std::unique_lock<decltype(mtx_unack_)> lk(mtx_unack_);
-                auto now = system_clock::now();
-                auto it = unacked_msgs_.begin();
-                while (it != unacked_msgs_.end()) {  // O(n)
-                    if (it->second.expiry > now) {
-                        break;
-                    }
-                    logger_.warn("keeper: remove expired unacked msg %lu", it->first);
-                    it = unacked_msgs_.erase(it);  // O(1)
-                    metrics_.unacked.fetch_sub(1, std::memory_order_relaxed);
-                }
-                lk.unlock();
-                try_attach();
-            }
-
-            auto elapsed_ms = duration_cast<milliseconds>(steady_clock::now() - t).count();
-            wait_ms = (elapsed_ms >= interval_ms) ? 0 : interval_ms - elapsed_ms;
+            logger_.warn("keeper: remove expired unacked msg %lu", it->first);
+            it = unacked_msgs_.erase(it);  // O(1)
+            metrics_.unacked.fetch_sub(1, std::memory_order_relaxed);
         }
+        lk.unlock();
+        try_attach();
     }
 
-    void sampler()
+    void sampling()
     {
-        static const auto interval_ms =
-            cfg_.get<int>("sampler_interval_sec", DEFAULT_SAMPLER_INTERVAL) * 1000;
-        int wait_ms = interval_ms;
-
-        tbd::poll poller(ev_sampler_);
-        while (true) {
-            const auto& evs = poller.wait(wait_ms);
-            auto t = steady_clock::now();
-            if (unlikely(!evs.empty())) {
-                return;
-            }
-
-            logger_.info(
-                "sampler: ingress %lu, egress %lu, ack %lu, rejected %lu, dropped %lu, pending %lu, unacked %lu",
-                metrics_.ingress.exchange(0, std::memory_order_relaxed),
-                metrics_.egress.exchange(0, std::memory_order_relaxed),
-                metrics_.ack.exchange(0, std::memory_order_relaxed),
-                metrics_.rejected.load(std::memory_order_relaxed),
-                metrics_.dropped.load(std::memory_order_relaxed),
-                metrics_.pending.load(std::memory_order_relaxed),
-                metrics_.unacked.load(std::memory_order_relaxed));
-            logger_.flush();
-
-            auto elapsed_ms = duration_cast<milliseconds>(steady_clock::now() - t).count();
-            wait_ms = (elapsed_ms >= interval_ms) ? 0 : interval_ms - elapsed_ms;
-        }
+        logger_.info(
+            "sampler: ingress %lu, egress %lu, ack %lu, rejected %lu, dropped %lu, pending %lu, unacked %lu",
+            metrics_.ingress.exchange(0, std::memory_order_relaxed),
+            metrics_.egress.exchange(0, std::memory_order_relaxed),
+            metrics_.ack.exchange(0, std::memory_order_relaxed),
+            metrics_.rejected.load(std::memory_order_relaxed),
+            metrics_.dropped.load(std::memory_order_relaxed),
+            metrics_.pending.load(std::memory_order_relaxed),
+            metrics_.unacked.load(std::memory_order_relaxed));
+        logger_.flush();
     }
 
     uint64_t backlog() const
