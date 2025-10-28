@@ -11,7 +11,16 @@
 #include <system_error>
 #include <vector>
 
+#define likely(x) __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
 namespace toymq {
+
+enum class role : uint8_t
+{
+    publisher = 1,
+    subscriber,
+};
 
 static constexpr uint8_t VERSION = 1;
 
