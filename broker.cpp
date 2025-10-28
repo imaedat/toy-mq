@@ -430,13 +430,14 @@ class broker
         , srvsock_((uint16_t)cfg_.get<int>("listen_port", DEFAULT_PORT))
         , logger_(cfg_.get<std::string>("log_procname", "broker"),
                   cfg_.get<std::string>("log_filepath", "broker.log"))
-        , db_(cfg_.get<std::string>("persistent_file", ":memory"))
+        , db_(cfg_.get<std::string>("persistent_file", ":memory:"))
         , running_(true)
         , sampler_(cfg_.get<int>("sampler_interval_sec", DEFAULT_SAMPLER_INTERVAL) * 1000,
                    [this] { sampling(); })
         , keeper_(cfg_.get<int>("keeper_interval_sec", DEFAULT_KEEPER_INTERVAL) * 1000,
                   [this] { clean_expired_msg(); })
         , thrpool_(cfg_.get<int>("worker_threads", DEFAULT_WORKERS))
+        , db_writer_(1)
         , nreactors_(cfg_.get<int>("reactor_threads", DEFAULT_REACTORS))
         , reactors_(nreactors_)
         , nrouters_(cfg.get<int>("router_threads", DEFAULT_ROUTERS))
@@ -522,6 +523,7 @@ class broker
     periodic_worker keeper_;
     // generic worker
     thread_pool thrpool_;
+    thread_pool db_writer_;
     // ack reactor
     size_t nreactors_;
     std::vector<std::unique_ptr<reactor>> reactors_;
@@ -645,7 +647,9 @@ class broker
                              msg.topic().data(), sockfd);
                 thrpool_.submit([this, sub_wp = it->second] { redeliver(sub_wp); });
                 lks.unlock();
-                db_insert_subscriber(subid);
+                std::string topic(msg.topic());
+                //db_writer_.submit([this, subid, topic] { db_insert_subscriber(subid, topic); });
+                db_insert_subscriber(subid, topic);
             } else {
                 helper::sendmsg(*sock, command::nack);
             }
@@ -751,7 +755,8 @@ class broker
                     }
                 } else {
                     rt.snap.clear();
-                    logger_.warn("router-%lu: subscriber already closed before topic matching", i);
+                    // XXX
+                    logger_.debug("router-%lu: subscriber already closed before topic matching", i);
                 }
             }
 
@@ -797,8 +802,8 @@ class broker
 
             if (!pushed_subs.empty()) {
                 std::weak_ptr<message> msg_wp(unacked.msg);
-                thrpool_.submit([this, msg_wp = std::move(msg_wp), expiry = unacked.expiry,
-                                 pushed_subs = std::move(pushed_subs)] {
+                db_writer_.submit([this, msg_wp = std::move(msg_wp), expiry = unacked.expiry,
+                                   pushed_subs = std::move(pushed_subs)] {
                     db_insert_message(msg_wp, expiry, pushed_subs);
                 });
             }
@@ -855,7 +860,8 @@ class broker
                  ");");
 
         db_.exec("create table if not exists subscribers ("
-                 "  subscriber_id text not null primary key"
+                 "  subscriber_id text not null primary key,"
+                 "  topic text not null"
                  ");");
 
         db_.exec("create table if not exists delivers ("
@@ -866,13 +872,17 @@ class broker
                  ");");
     }
 
-    void db_insert_subscriber(const std::string& subid)
+    void db_insert_subscriber(const std::string& subid, std::string_view topic)
     {
         std::string insert_stmt;
         insert_stmt.reserve(128);
-        insert_stmt.append("insert into subscribers (subscriber_id) values ('")
+        insert_stmt.append("insert into subscribers (subscriber_id, topic) values ('")
             .append(subid)
-            .append("') on conflict(subscriber_id) do nothing;");
+            .append("', '")
+            .append(topic)
+            .append("') on conflict(subscriber_id) do update set topic = '")
+            .append(topic)
+            .append("';");
         auto n = db_.exec(insert_stmt);
         if (n > 0) {
             logger_.info("broker: insert into subscribers subid %s", subid.c_str());
@@ -968,42 +978,21 @@ class broker
     }
 
     /******************************************************************
-     * from clients
+     * from client
      */
   public:
-    // pub:main, sub:reactor(handle), sub:worker(flush, unsubscribe)
     void close_client(role role, io_socket& sock)
     {
-        int sockfd = *sock;
-
         if (role == role::publisher) {
-            std::lock_guard<decltype(mtx_pubs_)> lkp(mtx_pubs_);
-            auto it = publishers_.find(sockfd);
-            if (it != publishers_.end()) {
-                epollfd_.del(sockfd);
-                sock.close();
-                publishers_.erase(it);
-                logger_.info("broker: close publisher (fd=%d)", sockfd);
-                logger_.flush();
-            }
-
+            close_publisher(sock);
         } else if (role == role::subscriber) {
-            auto [subid, ok] = reactors_[sockfd % nreactors_]->notify_close(sockfd);
-            std::lock_guard<decltype(mtx_subs_)> lks(mtx_subs_);
-            subscribers_.erase(sockfd);
-            if (ok) {
-                sub_last_updated_ = steady_clock::now();
-                logger_.info("broker: close subscriber (fd=%d)", sockfd);
-                logger_.flush();
-                db_delete_subscriber(subid);
-            }
-
+            close_subscriber(sock);
         } else {
             assert(false);
         }
     }
 
-    /*
+    /******************************************************************
      * from publisher
      */
   public:
@@ -1083,7 +1072,22 @@ class broker
         epollfd_.del(sockfd);
     }
 
-    /*
+    // main
+    void close_publisher(io_socket& sock)
+    {
+        int sockfd = *sock;
+        std::lock_guard<decltype(mtx_pubs_)> lkp(mtx_pubs_);
+        auto it = publishers_.find(sockfd);
+        if (it != publishers_.end()) {
+            epollfd_.del(sockfd);
+            sock.close();
+            publishers_.erase(it);
+            logger_.info("broker: close publisher (fd=%d)", sockfd);
+            logger_.flush();
+        }
+    }
+
+    /******************************************************************
      * from subscriber
      */
   public:
@@ -1127,13 +1131,9 @@ class broker
 
         if (!subid.empty()) {
             std::vector<std::pair<uint64_t, bool>> rmids{{msgid, dec_unacked}};
-            if (fastpath) {
-                thrpool_.submit([this, subid = std::move(subid), rmids = std::move(rmids)] {
-                    db_delete_delivers(subid, rmids);
-                });
-            } else {
+            db_writer_.submit([this, subid = std::move(subid), rmids = std::move(rmids)] {
                 db_delete_delivers(subid, rmids);
-            }
+            });
         }
     }
 
@@ -1156,12 +1156,14 @@ class broker
                 }
                 lk.unlock();
 
-                close_client(role::subscriber, sub->socket());
+                close_subscriber(sub->socket(), true);
                 if (dec_unacked) {
                     try_attach();
                 }
 
-                db_delete_delivers(subid, removed_msgids);
+                db_writer_.submit([this, subid, removed_msgids = std::move(removed_msgids)] {
+                    db_delete_delivers(subid, removed_msgids);
+                });
             }
         });
     }
@@ -1200,6 +1202,23 @@ class broker
     void on_emit(uint64_t count = 1)
     {
         metrics_.egress.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    // reactor(on handle), worker(on flush, unsubscribe)
+    void close_subscriber(io_socket& sock, bool unsubscribe = false)
+    {
+        int sockfd = *sock;
+        auto [subid, ok] = reactors_[sockfd % nreactors_]->notify_close(sockfd);
+        std::lock_guard<decltype(mtx_subs_)> lks(mtx_subs_);
+        subscribers_.erase(sockfd);
+        if (ok) {
+            sub_last_updated_ = steady_clock::now();
+            logger_.info("broker: close subscriber (fd=%d)", sockfd);
+            logger_.flush();
+            if (unsubscribe) {
+                db_delete_subscriber(subid);
+            }
+        }
     }
 };
 
@@ -1253,7 +1272,7 @@ bool publisher::dispatch(const message& msg)
 
     default:
         logger_.error("%s: unexpected command [%x]", name(), (uint8_t)msg.command());
-        broker_.close_client(role(), sock_);
+        broker_.close_publisher(sock_);
         return false;
     }
 
@@ -1280,7 +1299,7 @@ bool publisher::receive_publish(const message& msg)
         auto ec = helper::send_ack(*sock_, msgid);
         if (unlikely(ec)) {
             logger_.error("%s: send ack error: %s", name(), ec.message().c_str());
-            broker_.close_client(role(), sock_);
+            broker_.close_publisher(sock_);
             return false;
         }
         logger_.debug("%s: send back ack for msg %lu", name(), msgid);
@@ -1308,7 +1327,7 @@ bool subscriber::dispatch(const message& msg)
 
         default:
             logger_.error("%s: unexpected command [%x]", name(), (uint8_t)msg.command());
-            broker_.close_client(role(), sock_);
+            broker_.close_subscriber(sock_);
             return false;
         }
 
