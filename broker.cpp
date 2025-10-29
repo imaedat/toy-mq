@@ -35,14 +35,13 @@ broker::broker(const tbd::config& cfg)
     , srvsock_((uint16_t)cfg_.get<int>("listen_port", DEFAULT_PORT))
     , logger_(cfg_.get<std::string>("log_procname", "broker"),
               cfg_.get<std::string>("log_filepath", "broker.log"))
-    , db_(cfg_, logger_, cfg_.get<std::string>("persistent_file", ":memory:"))
+    , persist_(cfg_, logger_, cfg_.get<std::string>("persistent_file", ":memory:"))
     , running_(true)
     , sampler_(cfg_.get<int>("sampler_interval_sec", DEFAULT_SAMPLER_INTERVAL) * 1000,
                [this] { sampling(); })
     , keeper_(cfg_.get<int>("keeper_interval_sec", DEFAULT_KEEPER_INTERVAL) * 1000,
               [this] { clean_expired_msg(); })
     , thrpool_(cfg_.get<int>("worker_threads", DEFAULT_WORKERS))
-    , db_writer_(1)
     , nreactors_(cfg_.get<int>("reactor_threads", DEFAULT_REACTORS))
     , reactors_(nreactors_)
     , nrouters_(cfg.get<int>("router_threads", DEFAULT_ROUTERS))
@@ -183,7 +182,7 @@ again:
             thrpool_.submit([this, sub_wp = it->second.second] { redeliver(sub_wp); });
             lks.unlock();
             std::string topic(msg.topic());
-            db_.insert_subscriber(subid, topic);
+            persist_.insert_subscriber(subid, topic);
         } else {
             helper::sendmsg(*sock, command::nack);
         }
@@ -337,7 +336,7 @@ void broker::push_to_subscribers(router& rt, unacked_msg& unacked)
         lku.unlock();
 
         if (!pushed_subs.empty()) {
-            db_.insert_message(msg_wp, expiry, pushed_subs);
+            persist_.insert_message(msg_wp, expiry, pushed_subs);
         }
     }
 }
@@ -507,7 +506,7 @@ void broker::collect_unack(std::weak_ptr<subscriber>&& sub_wp, uint64_t msgid,
 
     if (!subid.empty()) {
         std::vector<std::pair<uint64_t, bool>> removed_msgids({{msgid, dec_unacked}});
-        db_.delete_delivers(subid, removed_msgids);
+        persist_.delete_delivers(subid, removed_msgids);
     }
 }
 
@@ -530,12 +529,12 @@ void broker::unsubscribe(std::weak_ptr<subscriber>&& sub_wp)
             lk.unlock();
 
             close_subscriber(subid);
-            db_.delete_subscriber(subid);
+            persist_.delete_subscriber(subid);
             if (dec_unacked) {
                 try_attach();
             }
 
-            db_.delete_delivers(subid, removed_msgids);
+            persist_.delete_delivers(subid, removed_msgids);
         }
     });
 }

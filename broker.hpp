@@ -135,7 +135,7 @@ class broker
     tbd::tcp_server srvsock_;
     tbd::epollfd epollfd_;
     tbd::logger logger_;
-    persistence db_;
+    persistence persist_;
     std::atomic<bool> running_{false};
 
     // { fd => client }
@@ -155,7 +155,6 @@ class broker
     periodic_worker keeper_;
     // generic worker
     tbd::thread_pool thrpool_;
-    tbd::thread_pool db_writer_;
     // ack reactor
     size_t nreactors_;
     std::vector<std::unique_ptr<reactor>> reactors_;

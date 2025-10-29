@@ -14,22 +14,6 @@
 
 namespace toymq {
 
-namespace {
-std::string bin2hex(const void* buf, size_t size)
-{
-    static constexpr const char hex[] = "0123456789abcdef";
-    const auto* p = (const uint8_t*)buf;
-    std::string s;
-    s.reserve(size * 2 + 1);
-    s.resize(size * 2);
-    for (size_t i = 0; i < size; ++i) {
-        s[i * 2] = hex[(p[i] >> 4) & 0x0FU];
-        s[i * 2 + 1] = hex[p[i] & 0x0FU];
-    }
-    return s;
-}
-}  // namespace
-
 class persistence
 {
   public:
@@ -60,29 +44,19 @@ class persistence
         db_.exec(
             "create index if not exists idx_deliv_subid on delivers(subscriber_id, message_id);");
 
-        // wal / off / persist
         const auto& jmode = cfg.get<std::string>("persistent_journal", "wal");
         db_.exec(std::string("pragma journal_mode = ") + jmode + ";");
 
-        // off
         const auto& sync = cfg.get<std::string>("persistent_sync", "normal");
         db_.exec(std::string("pragma synchronous = ") + sync + ";");
     }
 
     ~persistence() = default;
 
-    void insert_subscriber(const std::string& subid, std::string_view topic)
+    void insert_subscriber(const std::string& subid, const std::string& topic)
     {
-        std::string insert_stmt;
-        insert_stmt.reserve(128);
-        insert_stmt.append("insert into subscribers (subscriber_id, topic) values ('")
-            .append(subid)
-            .append("', '")
-            .append(topic)
-            .append("') on conflict(subscriber_id) do update set topic = '")
-            .append(topic)
-            .append("';");
-        auto n = db_.exec(insert_stmt);
+        auto n = db_.exec("insert into subscribers (subscriber_id, topic) values (?, ?);",
+                          {subid, topic});
         if (n > 0) {
             logger_.debug("broker: insert into subscribers subid %s", subid.c_str());
         }
@@ -90,32 +64,12 @@ class persistence
 
     void delete_subscriber(const std::string& subid)
     {
-        if (!subid.empty()) {
-            std::string delete_stmt;
-            delete_stmt.reserve(128);
-            delete_stmt.append("delete from subscribers where subscriber_id = '")
-                .append(subid)
-                .append("';");
-            auto n = db_.exec(delete_stmt);
-            if (n > 0) {
-                logger_.debug("broker: delete from subscribers subid %s", subid.c_str());
-            }
+        auto n = db_.exec("delete from subscribers where subscriber_id = ?;", {subid});
+        if (n > 0) {
+            logger_.debug("broker: delete from subscribers subid %s", subid.c_str());
         }
     }
 
-    /* ```
-     * sqlite3_stmt* stmt;
-     * sqlite3_prepare_v2(db,
-     *     "INSERT INTO message (message_id, expiry, topic, body) VALUES (?, ?, ?, ?)",
-     *     -1, &stmt, nullptr);
-     * sqlite3_bind_int64(stmt, 1, msg->id());
-     * sqlite3_bind_int64(stmt, 2, duration_cast<namespace>(expiry.time_since_epoch()).count());
-     * sqlite3_bind_text(stmt, 3, msg->topic().data(), msg->topic().size());
-     * sqlite3_bind_blob(stmt, 4, msg->data(), msg->data_size(), SQLITE_TRANSIENT);
-     * sqlite3_step(stmt);
-     * sqlite3_finalize(stmt);
-     * ```
-     */
     void insert_message(std::weak_ptr<message>& msg_wp,
                         std::chrono::system_clock::time_point expiry,
                         std::vector<std::string>& pushed_subs)
@@ -125,16 +79,17 @@ class persistence
         bg_writer_.submit([this, msg_wp = std::move(msg_wp), expiry,
                            pushed_subs = std::move(pushed_subs)] {
             if (auto msg = msg_wp.lock()) {
-                std::ostringstream ss;
-                ss << "insert into messages (message_id, expiry, topic, body) values ('"
-                   << msg->id() << "', '"
-                   << duration_cast<nanoseconds>(expiry.time_since_epoch()).count() << "', '"
-                   << msg->topic() << "', X'" << bin2hex(msg->data(), msg->data_size()) << "');";
-                auto n = db_.exec(ss.str());
+                auto n = db_.exec(
+                    "insert into messages (message_id, expiry, topic, body) values (?, ?, ?, ?);",
+                    {(int64_t)msg->id(),
+                     duration_cast<nanoseconds>(expiry.time_since_epoch()).count(),
+                     std::string(msg->topic()),
+                     tbd::sqlite::raw_buffer{msg->data(), msg->data_size()}});
                 if (n > 0) {
                     logger_.debug("broker: insert into messages msgid %lu", msg->id());
                 }
 
+                std::ostringstream ss;
                 ss.str("");
                 ss << "insert into delivers (message_id, subscriber_id) values ('" << msg->id()
                    << "', '" << pushed_subs[0];
@@ -198,6 +153,8 @@ class persistence
                 }
             });
     }
+
+    // TODO load()
 
   private:
     tbd::logger& logger_;
