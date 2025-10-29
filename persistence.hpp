@@ -10,6 +10,7 @@
 #include "logger.hpp"
 #include "sqlite.hpp"
 
+#include "broker.hpp"
 #include "proto.hpp"
 
 namespace toymq {
@@ -23,22 +24,24 @@ class persistence
         , bg_writer_(1)
     {
         db_.exec("create table if not exists messages ("
-                 "  message_id integer not null primary key,"
+                 "  id integer not null primary key,"
                  "  expiry integer not null,"
+                 "  size integer not null,"
                  "  topic text not null,"
+                 "  body_size integer not null,"
                  "  body blob"
                  ");");
 
         db_.exec("create table if not exists subscribers ("
-                 "  subscriber_id text not null primary key,"
+                 "  id text not null primary key,"
                  "  topic text not null"
                  ");");
 
         db_.exec("create table if not exists delivers ("
                  "  message_id integer not null primary key,"
                  "  subscriber_id text not null,"
-                 "  foreign key (message_id) references messages(message_id),"
-                 "  foreign key (subscriber_id) references subscribers(subscriber_id)"
+                 "  foreign key (message_id) references messages(id),"
+                 "  foreign key (subscriber_id) references subscribers(id)"
                  ");");
 
         db_.exec(
@@ -55,8 +58,7 @@ class persistence
 
     void insert_subscriber(const std::string& subid, const std::string& topic)
     {
-        auto n = db_.exec("insert into subscribers (subscriber_id, topic) values (?, ?);",
-                          {subid, topic});
+        auto n = db_.exec("insert into subscribers (id, topic) values (?, ?);", {subid, topic});
         if (n > 0) {
             logger_.debug("broker: insert into subscribers subid %s", subid.c_str());
         }
@@ -64,7 +66,7 @@ class persistence
 
     void delete_subscriber(const std::string& subid)
     {
-        auto n = db_.exec("delete from subscribers where subscriber_id = ?;", {subid});
+        auto n = db_.exec("delete from subscribers where id = ?;", {subid});
         if (n > 0) {
             logger_.debug("broker: delete from subscribers subid %s", subid.c_str());
         }
@@ -80,10 +82,10 @@ class persistence
                            pushed_subs = std::move(pushed_subs)] {
             if (auto msg = msg_wp.lock()) {
                 auto n = db_.exec(
-                    "insert into messages (message_id, expiry, topic, body) values (?, ?, ?, ?);",
+                    "insert into messages (id, expiry, size, topic, body_size, body) values (?, ?, ?, ?, ?, ?);",
                     {(int64_t)msg->id(),
                      duration_cast<nanoseconds>(expiry.time_since_epoch()).count(),
-                     std::string(msg->topic()),
+                     (int64_t)msg->length(), std::string(msg->topic()), (int64_t)msg->data_size(),
                      tbd::sqlite::raw_buffer{msg->data(), msg->data_size()}});
                 if (n > 0) {
                     logger_.debug("broker: insert into messages msgid %lu", msg->id());
@@ -136,7 +138,7 @@ class persistence
                 }
 
                 ss.str("");
-                ss << "delete from messages where message_id in ('__dummy__";
+                ss << "delete from messages where id in ('__dummy__";
                 for (const auto& [msgid, done] : removed_msgids) {
                     if (done) {
                         ss << "', '" << msgid;
@@ -154,7 +156,47 @@ class persistence
             });
     }
 
-    // TODO load()
+    void load(std::map<uint64_t, broker::unacked_msg>& unacked_msgs)
+    {
+        using namespace std::chrono;
+
+        auto cur = db_.cursor_for("select id, expiry, size, topic, body_size, body from messages;");
+        while (true) {
+            auto row = cur.next();
+            if (!row) {
+                break;
+            }
+            // TODO
+            broker::unacked_msg unacked;
+            unacked.msg = std::make_shared<message>((*row)[2].to_i());
+            unacked.msg->topic((*row)[3].to_s());
+            // unacked.msg->data(body, body_size);
+            unacked.msg->id((*row)[0].to_i());
+            unacked.expiry = system_clock::time_point(nanoseconds((*row)[1].to_i()));
+
+            unacked_msgs.emplace((*row)[0].to_i(), std::move(unacked));
+        }
+
+        uint64_t msgid_prev = 0;
+        auto it = unacked_msgs.begin();
+        auto cur2 =
+            db_.cursor_for("select message_id, subscriber_id from delivers order by message_id;");
+        while (true) {
+            auto row = cur2.next();
+            if (!row) {
+                break;
+            }
+            auto msgid = (uint64_t)(*row)[0].to_i();
+            if (msgid_prev != msgid) {
+                it = unacked_msgs.find(msgid);
+                if (it == unacked_msgs.end()) {
+                    continue;
+                }
+            }
+            msgid_prev = msgid;
+            it->second.subscribers.emplace((*row)[1].to_s(), std::shared_ptr<subscriber>(nullptr));
+        }
+    }
 
   private:
     tbd::logger& logger_;

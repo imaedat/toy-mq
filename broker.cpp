@@ -35,24 +35,28 @@ broker::broker(const tbd::config& cfg)
     , srvsock_((uint16_t)cfg_.get<int>("listen_port", DEFAULT_PORT))
     , logger_(cfg_.get<std::string>("log_procname", "broker"),
               cfg_.get<std::string>("log_filepath", "broker.log"))
-    , persist_(cfg_, logger_, cfg_.get<std::string>("persistent_file", ":memory:"))
+    , persist_(cfg_.get<std::string>("persistent_file").empty()
+                   ? nullptr
+                   : std::make_unique<persistence>(cfg_, logger_,
+                                                   cfg_.get<std::string>("persistent_file")))
     , running_(true)
-    , sampler_(cfg_.get<int>("sampler_interval_sec", DEFAULT_SAMPLER_INTERVAL) * 1000,
-               [this] { sampling(); })
-    , keeper_(cfg_.get<int>("keeper_interval_sec", DEFAULT_KEEPER_INTERVAL) * 1000,
-              [this] { clean_expired_msg(); })
     , thrpool_(cfg_.get<int>("worker_threads", DEFAULT_WORKERS))
     , nreactors_(cfg_.get<int>("reactor_threads", DEFAULT_REACTORS))
     , reactors_(nreactors_)
     , nrouters_(cfg.get<int>("router_threads", DEFAULT_ROUTERS))
     , routers_(nrouters_)
+    , sub_last_updated_(std::chrono::steady_clock::now())
 {
     logger_.set_level(cfg_.get<std::string>("log_level", "info"));
+    if (persist_) {
+        persist_->load(unacked_msgs_);
+        metrics_.unacked = unacked_msgs_.size();
+    }
     start_residents();
     epollfd_.add(*signalfd_);
     epollfd_.add(*srvsock_);
     logger_.info("----------------------------------------------------------------");
-    logger_.info("toy-mq broker start");
+    logger_.info("toy-mq broker start%s", persist_ ? "" : " (w/o persistence)");
 }
 
 broker::~broker()
@@ -109,8 +113,10 @@ bool broker::run_one()
 
 bool broker::handle_signal()
 {
+    static const std::unordered_map<int, const char*> sigabbrev{
+        {1, "HUP"}, {2, "INT"}, {3, "QUIT"}, {15, "TERM"}};
     auto sig = signalfd_.get_last_signal();
-    logger_.info("broker: receive SIG%s", sigabbrev_np(sig));
+    logger_.info("broker: receive SIG%s", sigabbrev.at(sig));
     logger_.flush();
     switch (sig) {
     case SIGHUP: {
@@ -181,8 +187,10 @@ again:
                          msg.topic().data(), sockfd, ridx);
             thrpool_.submit([this, sub_wp = it->second.second] { redeliver(sub_wp); });
             lks.unlock();
-            std::string topic(msg.topic());
-            persist_.insert_subscriber(subid, topic);
+            if (persist_) {
+                std::string topic(msg.topic());
+                persist_->insert_subscriber(subid, topic);
+            }
         } else {
             helper::sendmsg(*sock, command::nack);
         }
@@ -232,6 +240,15 @@ void broker::try_attach()
  */
 void broker::start_residents()
 {
+    static const auto sampler_interval =
+        cfg_.get<int>("sampler_interval_sec", DEFAULT_SAMPLER_INTERVAL) * 1000;
+    static const auto keeper_interval =
+        cfg_.get<int>("keeper_interval_sec", DEFAULT_KEEPER_INTERVAL) * 1000;
+
+    // (thrpool ->) sampler -> keeper -> reactor -> router
+    sampler_.start(sampler_interval, [this] { sampling(); });
+    keeper_.start(keeper_interval, [this] { clean_expired_msg(); });
+
     for (size_t i = 0; i < nreactors_; ++i) {
         reactors_[i] = std::make_unique<reactor>(cfg_, *this, logger_, i);
     }
@@ -243,6 +260,7 @@ void broker::start_residents()
 
 void broker::stop_residents()
 {
+    // router -> reactor -> keeper -> sampler (-> thrpool)
     running_ = false;
     std::for_each(routers_.begin(), routers_.end(), [](auto&& r) { r.cv.notify_one(); });
     std::for_each(reactors_.begin(), reactors_.end(), [](auto&& r) { r->stop(); });
@@ -335,8 +353,8 @@ void broker::push_to_subscribers(router& rt, unacked_msg& unacked)
         unacked_msgs_.emplace(msgid, std::move(unacked));  // O(log n)
         lku.unlock();
 
-        if (!pushed_subs.empty()) {
-            persist_.insert_message(msg_wp, expiry, pushed_subs);
+        if (persist_ && !pushed_subs.empty()) {
+            persist_->insert_message(msg_wp, expiry, pushed_subs);
         }
     }
 }
@@ -504,9 +522,9 @@ void broker::collect_unack(std::weak_ptr<subscriber>&& sub_wp, uint64_t msgid,
         try_attach();
     }
 
-    if (!subid.empty()) {
+    if (persist_ && !subid.empty()) {
         std::vector<std::pair<uint64_t, bool>> removed_msgids({{msgid, dec_unacked}});
-        persist_.delete_delivers(subid, removed_msgids);
+        persist_->delete_delivers(subid, removed_msgids);
     }
 }
 
@@ -529,12 +547,14 @@ void broker::unsubscribe(std::weak_ptr<subscriber>&& sub_wp)
             lk.unlock();
 
             close_subscriber(subid);
-            persist_.delete_subscriber(subid);
             if (dec_unacked) {
                 try_attach();
             }
 
-            persist_.delete_delivers(subid, removed_msgids);
+            if (persist_) {
+                persist_->delete_subscriber(subid);
+                persist_->delete_delivers(subid, removed_msgids);
+            }
         }
     });
 }

@@ -25,7 +25,6 @@
 #define THREAD_POOL_ENABLE_WAIT_ALL
 #include "thread_pool.hpp"
 
-#include "persistence.hpp"
 #include "proto.hpp"
 
 namespace toymq {
@@ -45,11 +44,9 @@ void join_thread(std::thread& thr)
 class periodic_worker
 {
   public:
-    template <typename F>
-    periodic_worker(int interval_ms, F&& task)
+    periodic_worker()
         : eventfd_()
         , poller_(eventfd_)
-        , thr_([this, interval_ms, task = std::forward<F>(task)] { loop(interval_ms, task); })
     {
     }
 
@@ -62,6 +59,13 @@ class periodic_worker
     void stop() const
     {
         eventfd_.write();
+    }
+
+    template <typename F>
+    void start(int interval_ms, F&& task)
+    {
+        thr_ = std::thread(
+            [this, interval_ms, task = std::forward<F>(task)] { loop(interval_ms, task); });
     }
 
   private:
@@ -92,18 +96,22 @@ class periodic_worker
 class reactor;
 class publisher;
 class subscriber;
+class persistence;
 
 /****************************************************************************
  * broker
  */
 class broker
 {
+  public:
     struct unacked_msg
     {
         std::shared_ptr<message> msg;
         std::chrono::system_clock::time_point expiry;
         std::unordered_map<std::string, std::weak_ptr<subscriber>> subscribers;
     };
+
+  private:
     struct router
     {
         size_t i;
@@ -135,7 +143,7 @@ class broker
     tbd::tcp_server srvsock_;
     tbd::epollfd epollfd_;
     tbd::logger logger_;
-    persistence persist_;
+    std::unique_ptr<persistence> persist_ = nullptr;
     std::atomic<bool> running_{false};
 
     // { fd => client }
@@ -212,6 +220,7 @@ class broker
 
 }  // namespace toymq
 #include "client.hpp"
+#include "persistence.hpp"
 namespace toymq {
 
 /****************************************************************************

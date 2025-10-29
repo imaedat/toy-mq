@@ -64,6 +64,14 @@ struct message
         hdr()->command = (uint8_t)command::push;
         id(msgid);
     }
+    // load from db
+    message(size_t size)
+        : buf(size, 0)
+    {
+        hdr()->version = VERSION;
+        hdr()->command = (uint8_t)command::push;
+        hdr()->length = htons(size);
+    }
 
     message(const message&) = default;
     message& operator=(const message&) = delete;
@@ -112,6 +120,13 @@ struct message
         return {(char*)&payload()[1], topic_size() - 1};
     }
 
+    void topic(const std::string& t) noexcept
+    {
+        assert(t.size() <= 255);
+        payload()[0] = t.size() + 1;
+        ::memcpy((char*)&payload()[1], t.data(), t.size());
+    }
+
     uint64_t id() const noexcept
     {
         return be64toh(*(uint64_t*)(buf.data() + length() - sizeof(uint64_t)));
@@ -138,6 +153,12 @@ struct message
             buf.begin() + sizeof(header) + sizeof(uint8_t) + topic_size() + sizeof(uint16_t);
         auto end = begin + data_size();
         return {begin, end};
+    }
+
+    void data(const void* b, size_t s) noexcept
+    {
+        *(uint16_t*)(payload() + sizeof(uint8_t) + topic_size()) = htons(s);
+        ::memcpy(data(), b, s);
     }
 };
 
