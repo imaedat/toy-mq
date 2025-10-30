@@ -24,7 +24,7 @@ class persistence
         , bg_writer_(1)
     {
         db_.exec("create table if not exists messages ("
-                 "  id integer not null primary key,"
+                 "  id integer primary key,"
                  "  expiry integer not null,"
                  "  size integer not null,"
                  "  topic text not null,"
@@ -35,10 +35,10 @@ class persistence
         db_.exec("create table if not exists subscribers ("
                  "  id text not null primary key,"
                  "  topic text not null"
-                 ");");
+                 ") without rowid;");
 
         db_.exec("create table if not exists delivers ("
-                 "  message_id integer not null primary key,"
+                 "  message_id integer primary key,"
                  "  subscriber_id text not null,"
                  "  foreign key (message_id) references messages(id),"
                  "  foreign key (subscriber_id) references subscribers(id)"
@@ -54,13 +54,20 @@ class persistence
         db_.exec(std::string("pragma synchronous = ") + sync + ";");
     }
 
-    ~persistence() = default;
-
-    void insert_subscriber(const std::string& subid, const std::string& topic)
+    ~persistence()
     {
-        auto n = db_.exec("insert into subscribers (id, topic) values (?, ?);", {subid, topic});
+        auto qsz = bg_writer_.queue_size();
+        if (qsz >= 100'000) {
+            logger_.info("broker: bg_writer holds too many flush tasks (%lu), wait ...", qsz);
+        }
+    }
+
+    void insert_subscriber(const std::shared_ptr<subscriber>& sub)
+    {
+        auto n = db_.exec("insert into subscribers (id, topic) values (?, ?);",
+                          {sub->client_id(), sub->topic()});
         if (n > 0) {
-            logger_.debug("broker: insert into subscribers subid %s", subid.c_str());
+            logger_.debug("broker: insert into subscribers subid %s", sub->client_id());
         }
     }
 
@@ -72,14 +79,13 @@ class persistence
         }
     }
 
-    void insert_message(std::weak_ptr<message>& msg_wp,
-                        std::chrono::system_clock::time_point expiry,
-                        std::vector<std::string>& pushed_subs)
+    void insert_message(broker::unacked_msg& unacked)
     {
         using namespace std::chrono;
 
-        bg_writer_.submit([this, msg_wp = std::move(msg_wp), expiry,
-                           pushed_subs = std::move(pushed_subs)] {
+        std::weak_ptr<message> msg_wp(unacked.msg);
+        bg_writer_.submit([this, msg_wp = std::move(msg_wp), expiry = unacked.expiry,
+                           subscribers = unacked.subscribers] {
             if (auto msg = msg_wp.lock()) {
                 auto n = db_.exec(
                     "insert into messages (id, expiry, size, topic, body_size, body) values (?, ?, ?, ?, ?, ?);",
@@ -88,89 +94,90 @@ class persistence
                      (int64_t)msg->length(), std::string(msg->topic()), (int64_t)msg->data_size(),
                      tbd::sqlite::raw_buffer{msg->data(), msg->data_size()}});
                 if (n > 0) {
-                    logger_.debug("broker: insert into messages msgid %lu", msg->id());
+                    logger_.debug("writer: insert into messages msgid %lu", msg->id());
                 }
 
+                auto it = subscribers.cbegin();
                 std::ostringstream ss;
-                ss.str("");
-                ss << "insert into delivers (message_id, subscriber_id) values ('" << msg->id()
-                   << "', '" << pushed_subs[0];
-                for (size_t i = 1; i < pushed_subs.size(); ++i) {
-                    ss << "'), ('" << msg->id() << "', '" << pushed_subs[i];
+                ss << "insert into delivers (message_id, subscriber_id) values (" << msg->id()
+                   << ", '" << it->first;
+                for (++it; it != subscribers.cend(); ++it) {
+                    ss << "'), (" << msg->id() << ", '" << it->first;
                 }
                 ss << "');";
                 auto m = db_.exec(ss.str());
                 if (m > 0) {
-                    logger_.debug("broker: insert into delivers for %ld subscribers", m);
+                    logger_.debug("writer: insert into delivers for %ld subscribers", m);
                 }
 
             } else {
-                // logger_.debug("broker: msg already expired (i.e. acked)");
+                // logger_.debug("writer: msg already expired (i.e. acked)");
             }
         });
     }
 
-    void delete_delivers(std::string& subid, std::vector<std::pair<uint64_t, bool>>& removed_msgids)
+    void delete_delivers(const std::string& subid,
+                         std::vector<std::pair<uint64_t, bool>>& removed_msgids)
     {
         if (removed_msgids.empty()) {
             return;
         }
 
-        bg_writer_.submit(
-            [this, subid = std::move(subid), removed_msgids = std::move(removed_msgids)] {
-                uint64_t msgid1st = (removed_msgids.size() == 1) ? removed_msgids[0].first : 0;
-                std::ostringstream ss;
-                ss << "delete from delivers where subscriber_id = '" << subid
-                   << "' and message_id in ('__dummy__";
-                for (const auto& [msgid, done] : removed_msgids) {
-                    ss << "', '" << msgid;
+        bg_writer_.submit([this, subid, removed_msgids = std::move(removed_msgids)] {
+            uint64_t msgid1st = (removed_msgids.size() == 1) ? removed_msgids[0].first : 0;
+            std::ostringstream ss;
+            ss << "delete from delivers where subscriber_id = '" << subid
+               << "' and message_id in (-1";
+            for (const auto& [msgid, done] : removed_msgids) {
+                ss << ", " << msgid;
+            }
+            ss << ");";
+            auto n = db_.exec(ss.str());
+            if (n > 0) {
+                if (msgid1st > 0) {
+                    logger_.debug("writer: delete from delivers subid %s, msgid %lu", subid.c_str(),
+                                  msgid1st);
+                } else {
+                    logger_.debug("writer: delete from delivers subid %s, %ld msgs", subid.c_str(),
+                                  n);
                 }
-                ss << "');";
-                auto n = db_.exec(ss.str());
-                if (n > 0) {
-                    if (msgid1st > 0) {
-                        logger_.debug("broker: delete from delivers subid %s, msgid %lu",
-                                      subid.c_str(), msgid1st);
-                    } else {
-                        logger_.debug("broker: delete from delivers subid %s, %ld msgs",
-                                      subid.c_str(), n);
-                    }
-                }
+            }
 
-                ss.str("");
-                ss << "delete from messages where id in ('__dummy__";
-                for (const auto& [msgid, done] : removed_msgids) {
-                    if (done) {
-                        ss << "', '" << msgid;
-                    }
+            ss.str("");
+            ss << "delete from messages where id in (-1";
+            for (const auto& [msgid, done] : removed_msgids) {
+                if (done) {
+                    ss << ", " << msgid;
                 }
-                ss << "');";
-                auto m = db_.exec(ss.str());
-                if (m > 0) {
-                    if (msgid1st > 0) {
-                        logger_.debug("broker: delete from messages msgid %ld", msgid1st);
-                    } else {
-                        logger_.debug("broker: delete from messages %ld msgs", m);
-                    }
+            }
+            ss << ");";
+            auto m = db_.exec(ss.str());
+            if (m > 0) {
+                if (msgid1st > 0) {
+                    logger_.debug("writer: delete from messages msgid %ld", msgid1st);
+                } else {
+                    logger_.debug("writer: delete from messages %ld msgs", m);
                 }
-            });
+            }
+        });
     }
 
     void load(std::map<uint64_t, broker::unacked_msg>& unacked_msgs)
     {
         using namespace std::chrono;
 
-        auto cur = db_.cursor_for("select id, expiry, size, topic, body_size, body from messages;");
+        auto cur1 =
+            db_.cursor_for("select id, expiry, size, topic, body_size, body from messages;");
         while (true) {
-            auto row = cur.next();
+            auto row = cur1.next();
             if (!row) {
                 break;
             }
-            // TODO
             broker::unacked_msg unacked;
             unacked.msg = std::make_shared<message>((*row)[2].to_i());
             unacked.msg->topic((*row)[3].to_s());
-            // unacked.msg->data(body, body_size);
+            const auto& b = (*row)[5].to_b();
+            unacked.msg->data(b.data(), b.size());
             unacked.msg->id((*row)[0].to_i());
             unacked.expiry = system_clock::time_point(nanoseconds((*row)[1].to_i()));
 
@@ -195,6 +202,10 @@ class persistence
             }
             msgid_prev = msgid;
             it->second.subscribers.emplace((*row)[1].to_s(), std::shared_ptr<subscriber>(nullptr));
+        }
+
+        if (!unacked_msgs.empty()) {
+            logger_.info("broker: load %lu unacked msgs", unacked_msgs.size());
         }
     }
 

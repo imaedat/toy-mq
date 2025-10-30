@@ -48,21 +48,22 @@ broker::broker(const tbd::config& cfg)
     , sub_last_updated_(std::chrono::steady_clock::now())
 {
     logger_.set_level(cfg_.get<std::string>("log_level", "info"));
-    if (persist_) {
+    logger_.info("----------------------------------------------------------------");
+    logger_.info("toy-mq broker start%s", persist_ ? "" : " (w/o persistence)");
+    if (likely(persist_)) {
         persist_->load(unacked_msgs_);
         metrics_.unacked = unacked_msgs_.size();
     }
     start_residents();
     epollfd_.add(*signalfd_);
     epollfd_.add(*srvsock_);
-    logger_.info("----------------------------------------------------------------");
-    logger_.info("toy-mq broker start%s", persist_ ? "" : " (w/o persistence)");
 }
 
 broker::~broker()
 {
     stop_residents();
     thrpool_.wait_all();
+    persist_.reset();  // dtor -> wait bg_writer completed
     logger_.info("toy-mq broker terminated");
 }
 
@@ -177,23 +178,31 @@ again:
     }
 
     case command::subscribe: {
-        auto ridx = sockfd % nreactors_;
-        auto sub = reactors_[ridx]->delegate(sock, msg);
-        if (likely(sub)) {
-            std::unique_lock<decltype(mtx_subs_)> lks(mtx_subs_);
-            std::string subid = sub->client_id();
-            auto [it, _] = subscribers_.emplace(subid, std::make_pair(ridx, std::move(sub)));
-            logger_.info("broker: accept new subscriber %s [%s] (fd=%d, reactor-%d)", subid,
-                         msg.topic().data(), sockfd, ridx);
-            thrpool_.submit([this, sub_wp = it->second.second] { redeliver(sub_wp); });
-            lks.unlock();
-            if (persist_) {
-                std::string topic(msg.topic());
-                persist_->insert_subscriber(subid, topic);
+        auto shard = sockfd % nreactors_;
+        auto sub = std::make_shared<subscriber>(*this, logger_, sock, msg, shard);
+        const auto& subid = sub->client_id();
+        std::unique_lock<decltype(mtx_subs_)> lks(mtx_subs_);
+        auto it = subscribers_.find(subid);
+        if (unlikely(it != subscribers_.end())) {
+            if (it->second->leaving()) {
+                subscribers_.erase(it);  // last shared_ptr -> dtor
+            } else {
+                logger_.error("broker: subscriber id %s is already active, reject it", subid);
+                helper::sendmsg(*sock, command::nack);
+                break;
             }
-        } else {
-            helper::sendmsg(*sock, command::nack);
         }
+        subscribers_.emplace(subid, sub);
+        sub_last_updated_ = steady_clock::now();
+        logger_.info("broker: accept new subscriber %s [%s] (fd=%d, reactor-%d)", subid.c_str(),
+                     sub->topic().c_str(), *sub->socket(), sub->shard());
+        if (likely(persist_)) {
+            persist_->insert_subscriber(sub);
+        }
+        lks.unlock();
+        reactors_[shard]->add_subscriber(sub);
+        std::weak_ptr<subscriber> sub_wp(sub);
+        thrpool_.submit([this, sub_wp = std::move(sub_wp)] { redeliver(sub_wp); });
         break;
     }
 
@@ -207,7 +216,7 @@ again:
 void broker::redeliver(const std::weak_ptr<subscriber>& sub_wp)
 {
     if (auto sub = sub_wp.lock()) {
-        std::lock_guard<decltype(mtx_unack_)> lk(mtx_unack_);
+        std::lock_guard<decltype(mtx_unack_)> lku(mtx_unack_);
         for (const auto& [_, unacked] : unacked_msgs_) {  // O(n)
             if (unacked.subscribers.find(sub->client_id()) != unacked.subscribers.end()) {
                 // O(1)
@@ -225,7 +234,7 @@ void broker::try_attach()
     static const auto threshold = (unsigned long)std::ceil(1.0 * max * lo / 100);
 
     if (metrics_.pending + metrics_.unacked <= threshold) {
-        std::shared_lock<decltype(mtx_pubs_)> lk(mtx_pubs_);
+        std::shared_lock<decltype(mtx_pubs_)> lkp(mtx_pubs_);
         for (auto&& [sockfd, pub] : publishers_) {  // O(n)
             if (pub->attach_if_detached()) {
                 logger_.info("broker: pub-%d attached back!", sockfd);
@@ -287,26 +296,21 @@ void broker::msg_router(size_t i)
         metrics_.pending.fetch_sub(1, std::memory_order_relaxed);
 
         // subscribers snapshot
-        if (rt.snap.empty() || rt.last_snapped_ < sub_last_updated_.load()) {
-            std::shared_lock<decltype(mtx_subs_)> lk(mtx_subs_);
+        if (rt.snap.empty() || rt.last_snapped < sub_last_updated_.load()) {
+            rt.snap.clear();
+            std::shared_lock<decltype(mtx_subs_)> lks(mtx_subs_);
             rt.snap.reserve(subscribers_.size());
-            for (const auto& [_, pair] : subscribers_) {  // O(n)
-                rt.snap.emplace_back(pair.second);
+            for (const auto& [_, sub] : subscribers_) {  // O(n)
+                rt.snap.emplace_back(sub);
             }
-            rt.last_snapped_ = steady_clock::now();
+            rt.last_snapped = steady_clock::now();
         }
 
         // topic matching
         unacked_msg unacked;
-        for (const auto& sub_wp : rt.snap) {
-            if (auto sub = sub_wp.lock()) {
-                if (sub->match(msg->topic())) {
-                    unacked.subscribers.emplace(sub->client_id(), sub);
-                }
-            } else {
-                rt.snap.clear();
-                // XXX
-                logger_.debug("router-%lu: subscriber already closed before topic matching", i);
+        for (const auto& sub : rt.snap) {
+            if (sub->match(msg->topic())) {
+                unacked.subscribers.emplace(sub->client_id(), sub);
             }
         }
 
@@ -328,7 +332,7 @@ void broker::push_to_subscribers(router& rt, unacked_msg& unacked)
         metrics_.unacked.fetch_add(1, std::memory_order_relaxed);
         const auto msgid = unacked.msg->id();
         logger_.debug("router-%lu: process msg %lu (backlog %lu)", rt.i, msgid, backlog());
-        std::unique_lock<decltype(mtx_unack_)> lku(mtx_unack_);
+        std::lock_guard<decltype(mtx_unack_)> lku(mtx_unack_);
         if (policy == "drop" && backlog() >= max) {
             auto it = unacked_msgs_.begin();  // O(1)
             logger_.warn("router-%lu: backlog overflow, drop oldest msg %lu", rt.i, it->first);
@@ -337,31 +341,25 @@ void broker::push_to_subscribers(router& rt, unacked_msg& unacked)
             metrics_.dropped.fetch_add(1, std::memory_order_relaxed);
         }
         assert(unacked_msgs_.find(msgid) == unacked_msgs_.end());  // O(log n)
-        std::weak_ptr<message> msg_wp(unacked.msg);
-        auto expiry = unacked.expiry;
-        std::vector<std::string> pushed_subs;
-        pushed_subs.reserve(unacked.subscribers.size());
-        for (auto&& [subid, sub_wp] : unacked.subscribers) {
+        for (auto&& [_, sub_wp] : unacked.subscribers) {
             if (auto sub = sub_wp.lock()) {
                 sub->push(unacked.msg);
-                pushed_subs.emplace_back(subid);
             } else {
                 rt.snap.clear();
                 logger_.warn("router-%lu: subscriber already closed before push", rt.i);
             }
         }
-        unacked_msgs_.emplace(msgid, std::move(unacked));  // O(log n)
-        lku.unlock();
 
-        if (persist_ && !pushed_subs.empty()) {
-            persist_->insert_message(msg_wp, expiry, pushed_subs);
+        if (likely(persist_)) {
+            persist_->insert_message(unacked);
         }
+        unacked_msgs_.emplace(msgid, std::move(unacked));  // O(log n)
     }
 }
 
 void broker::clean_expired_msg()
 {
-    std::unique_lock<decltype(mtx_unack_)> lk(mtx_unack_);
+    std::unique_lock<decltype(mtx_unack_)> lku(mtx_unack_);
     auto now = system_clock::now();
     auto it = unacked_msgs_.begin();
     while (it != unacked_msgs_.end()) {  // O(n)
@@ -372,21 +370,33 @@ void broker::clean_expired_msg()
         it = unacked_msgs_.erase(it);  // O(1)
         metrics_.unacked.fetch_sub(1, std::memory_order_relaxed);
     }
-    lk.unlock();
+    lku.unlock();
     try_attach();
 }
 
+#define FMT_RATE "rate [ingress %lu, egress %lu, ack %lu]"
+#define FMT_GAUGE "gauge [pending %lu, unacked %lu]"
+#define FMT_COUNTER "counter [ingress %lu, ack %lu, rejected %lu, dropped %lu]"
 void broker::sampling()
 {
-    logger_.info(
-        "sampler: ingress %lu, egress %lu, ack %lu, rejected %lu, dropped %lu, pending %lu, unacked %lu",
-        metrics_.ingress.exchange(0, std::memory_order_relaxed),
-        metrics_.egress.exchange(0, std::memory_order_relaxed),
-        metrics_.ack.exchange(0, std::memory_order_relaxed),
-        metrics_.rejected.load(std::memory_order_relaxed),
-        metrics_.dropped.load(std::memory_order_relaxed),
-        metrics_.pending.load(std::memory_order_relaxed),
-        metrics_.unacked.load(std::memory_order_relaxed));
+    static uint64_t total_ingress = 0;
+    static uint64_t total_ack = 0;
+
+    auto ingress = metrics_.ingress.exchange(0, std::memory_order_relaxed);
+    auto egress = metrics_.egress.exchange(0, std::memory_order_relaxed);
+    auto ack = metrics_.ack.exchange(0, std::memory_order_relaxed);
+    total_ingress += ingress;
+    total_ack += ack;
+
+    logger_.info("sampler: " FMT_RATE ",\t" FMT_GAUGE ",\t" FMT_COUNTER,
+                 // rate
+                 ingress, egress, ack,
+                 // gauge
+                 metrics_.pending.load(std::memory_order_relaxed),
+                 metrics_.unacked.load(std::memory_order_relaxed),
+                 // counter
+                 total_ingress, total_ack, metrics_.rejected.load(std::memory_order_relaxed),
+                 metrics_.dropped.load(std::memory_order_relaxed));
     logger_.flush();
 }
 
@@ -410,7 +420,7 @@ std::pair<bool, uint64_t> broker::enqueue_deliver(const message& orig_msg, int s
 
     auto& rt = routers_[sockfd % nrouters_];
     logger_.debug("broker: enqueue msg %lu [%s] to router-%lu", msgid, orig_msg.topic(), rt.i);
-    std::lock_guard<decltype(rt.mtx)> lk(rt.mtx);
+    std::lock_guard<decltype(rt.mtx)> lkr(rt.mtx);
     rt.queue.emplace_back(std::move(new_msg));
     rt.cv.notify_one();
 
@@ -491,22 +501,22 @@ void broker::receive_ack(std::weak_ptr<subscriber>&& sub_wp, const message& msg)
     metrics_.ack.fetch_add(1, std::memory_order_relaxed);
     auto msgid = msg.id();
 
-    std::unique_lock<decltype(mtx_unack_)> lk(mtx_unack_, std::defer_lock);
-    if (lk.try_lock()) {  // inline path
-        collect_unack(std::move(sub_wp), msgid, lk, true);
+    std::unique_lock<decltype(mtx_unack_)> lku(mtx_unack_, std::defer_lock);
+    if (lku.try_lock()) {  // inline path
+        collect_unack(std::move(sub_wp), msgid, lku, true);
         return;
     }
 
     // later ...
     thrpool_.submit([this, sub_wp = std::move(sub_wp), msgid]() mutable {
-        std::unique_lock<decltype(mtx_unack_)> lk(mtx_unack_);
-        collect_unack(std::move(sub_wp), msgid, lk, false);
+        std::unique_lock<decltype(mtx_unack_)> lku(mtx_unack_);
+        collect_unack(std::move(sub_wp), msgid, lku, false);
     });
 }
 
 // reactor or worker (under locked for unacked_msgs_)
 void broker::collect_unack(std::weak_ptr<subscriber>&& sub_wp, uint64_t msgid,
-                           std::unique_lock<decltype(mtx_unack_)>& lk, bool fastpath)
+                           std::unique_lock<decltype(mtx_unack_)>& lku, bool fastpath)
 {
     std::string subid;
     bool dec_unacked = false;
@@ -515,46 +525,46 @@ void broker::collect_unack(std::weak_ptr<subscriber>&& sub_wp, uint64_t msgid,
         sub->ack_arrived(msgid);
         dec_unacked = remove_unacked(msgid, subid);
     }
-    lk.unlock();
+    lku.unlock();
     if (dec_unacked) {
         const auto& role = fastpath ? "reactor" : "worker";
         logger_.debug("%s: all subscribers sent ack for msg %lu", role, msgid);
         try_attach();
     }
 
-    if (persist_ && !subid.empty()) {
+    if (likely(persist_ && !subid.empty())) {
         std::vector<std::pair<uint64_t, bool>> removed_msgids({{msgid, dec_unacked}});
         persist_->delete_delivers(subid, removed_msgids);
     }
 }
 
 // reactor -> worker
-void broker::unsubscribe(std::weak_ptr<subscriber>&& sub_wp)
+void broker::unsubscribe(const std::shared_ptr<subscriber>& sub)
 {
-    thrpool_.submit([this, sub_wp = std::move(sub_wp)] {
-        if (auto sub = sub_wp.lock()) {
-            std::string subid = sub->client_id();
-            bool dec_unacked = false;
-            std::unique_lock<decltype(mtx_unack_)> lk(mtx_unack_);
-            const auto& msgids = sub->unacked_msgids();
-            std::vector<std::pair<uint64_t, bool>> removed_msgids;
-            removed_msgids.reserve(msgids.size());
-            for (const auto& msgid : msgids) {  // O(n)
-                bool done = remove_unacked(msgid, subid);
-                removed_msgids.emplace_back(std::make_pair(msgid, done));
-                dec_unacked |= done;
-            }
-            lk.unlock();
+    std::unique_lock<decltype(mtx_subs_)> lks(mtx_subs_);
+    subscribers_.erase(sub->client_id());
+    lks.unlock();
+    sub_last_updated_ = steady_clock::now();
 
-            close_subscriber(subid);
-            if (dec_unacked) {
-                try_attach();
-            }
+    thrpool_.submit([this, subid = sub->client_id(), unacked_msgids = sub->unacked_msgids()] {
+        bool dec_unacked = false;
+        std::unique_lock<decltype(mtx_unack_)> lku(mtx_unack_);
+        std::vector<std::pair<uint64_t, bool>> removed_msgids;
+        removed_msgids.reserve(unacked_msgids.size());
+        for (const auto& msgid : unacked_msgids) {  // O(n)
+            bool done = remove_unacked(msgid, subid);
+            removed_msgids.emplace_back(std::make_pair(msgid, done));
+            dec_unacked |= done;
+        }
+        lku.unlock();
 
-            if (persist_) {
-                persist_->delete_subscriber(subid);
-                persist_->delete_delivers(subid, removed_msgids);
-            }
+        if (likely(persist_)) {
+            persist_->delete_subscriber(subid);
+            persist_->delete_delivers(subid, removed_msgids);
+        }
+
+        if (dec_unacked) {
+            try_attach();
         }
     });
 }
@@ -593,24 +603,16 @@ void broker::on_emit(uint64_t count)
     metrics_.egress.fetch_add(count, std::memory_order_relaxed);
 }
 
-// reactor(on handle), worker(on flush, unsubscribe)
-void broker::close_subscriber(const std::string& subid)
+// reactor
+void broker::close_subscriber(const std::shared_ptr<subscriber>& sub, bool unsub)
 {
-    logger_.info("broker: close subscriber %s", subid.c_str());
-    int ridx = -1;
-    std::unique_lock<decltype(mtx_subs_)> lks(mtx_subs_);
-    auto it = subscribers_.find(subid);
-    if (it != subscribers_.end()) {
-        ridx = it->second.first;
-        subscribers_.erase(it);
-    }
-    lks.unlock();
-    if (ridx >= 0) {
-        reactors_[ridx]->notify_close(subid);  // dtor shared_ptr -> invalidate all weak_ptrs
-    }
+    const auto& subid = sub->client_id();
+    reactors_[sub->shard()]->notify_close(sub->client_id());
+    logger_.info("broker: %s subscriber %s", unsub ? "unsubscribe" : "close", subid.c_str());
 
-    sub_last_updated_ = steady_clock::now();
-    logger_.flush();
+    if (unsub) {
+        unsubscribe(sub);
+    }
 }
 
 }  // namespace toymq

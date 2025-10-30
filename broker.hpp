@@ -119,8 +119,8 @@ class broker
         std::condition_variable cv;
         std::mutex mtx;
         std::deque<std::shared_ptr<message>> queue;
-        std::vector<std::weak_ptr<subscriber>> snap;
-        std::chrono::steady_clock::time_point last_snapped_;
+        std::vector<std::shared_ptr<subscriber>> snap;
+        std::chrono::steady_clock::time_point last_snapped;
     };
     struct metrics
     {
@@ -146,10 +146,11 @@ class broker
     std::unique_ptr<persistence> persist_ = nullptr;
     std::atomic<bool> running_{false};
 
-    // { fd => client }
+    // { fd => publisher }
     std::unordered_map<int, std::unique_ptr<publisher>> publishers_;
     std::shared_mutex mtx_pubs_;
-    std::unordered_map<std::string, std::pair<size_t, std::weak_ptr<subscriber>>> subscribers_;
+    // { subid => subscriber }
+    std::unordered_map<std::string, std::shared_ptr<subscriber>> subscribers_;
     std::shared_mutex mtx_subs_;
 
     // { msgid => { msg, expiry, subscribers } }
@@ -184,10 +185,9 @@ class broker
 
     // subscriber
     void receive_ack(std::weak_ptr<subscriber>&& sub_wp, const message& msg);
-    void unsubscribe(std::weak_ptr<subscriber>&& sub_wp);
     void enqueue_flush(std::weak_ptr<subscriber>&& sub_wp);
     void on_emit(uint64_t count = 1);
-    void close_subscriber(const std::string& subid);
+    void close_subscriber(const std::shared_ptr<subscriber>& subid, bool unsub = false);
 
   private:
     bool run_one();
@@ -216,6 +216,7 @@ class broker
     void collect_unack(std::weak_ptr<subscriber>&& sub_wp, uint64_t msgid,
                        std::unique_lock<decltype(mtx_unack_)>& lk, bool fastpath);
     bool remove_unacked(uint64_t msgid, const std::string& subid);
+    void unsubscribe(const std::shared_ptr<subscriber>& sub);
 };
 
 }  // namespace toymq
@@ -293,25 +294,20 @@ class reactor
     }
 
     // main
-    std::shared_ptr<subscriber> delegate(tbd::io_socket& sock, const message& msg)
+    void add_subscriber(const std::shared_ptr<subscriber>& sub)
     {
-        int sockfd = *sock;
-        logger_.debug("%s: delegated subscriber %d", name(), sockfd);
-        std::string_view subid((const char*)msg.data());
+        int sockfd = *sub->socket();
+
         std::unique_lock<decltype(mtx_)> lk(mtx_);
-        if (unlikely(subscribers_.find(subid.data()) != subscribers_.end())) {
-            logger_.error("%s: subscriber id %s is already active, reject it", name(), subid);
-            return nullptr;
-        }
-        auto [it, _] = subscribers_.emplace(
-            subid, std::make_shared<subscriber>(broker_, logger_, sock, msg.topic(), subid));
-        sock2id_map_.emplace(sockfd, subid);
+        subscribers_.emplace(sub->client_id(), sub);
+        sock2id_map_.emplace(sockfd, sub->client_id());
         lk.unlock();
+
         epollfd_.add(sockfd);
-        return it->second;
+        // TODO logger_.debug(" add subscriber ");
     }
 
-    // reactor, worker
+    // reactor
     void notify_close(const std::string& subid)
     {
         std::unique_lock<decltype(mtx_)> lk(mtx_);
@@ -321,9 +317,8 @@ class reactor
             sock2id_map_.erase(sockfd);
             std::error_code ec;
             epollfd_.del(sockfd, ec);
-            subscribers_.erase(it);  // dtor -> socket close
+            subscribers_.erase(it);
         }
-        logger_.debug("%s: close subscriber %d", name(), subid);
     }
 
   private:

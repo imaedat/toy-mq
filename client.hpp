@@ -31,6 +31,23 @@ class client
     struct socket_closed
     {};
 
+  protected:
+    toymq::broker& broker_;
+    tbd::logger& logger_;
+    tbd::io_socket sock_;
+    const toymq::role role_;
+    const std::string name_;
+
+    client(broker& b, tbd::logger& l, tbd::io_socket& s, toymq::role r) noexcept
+        : broker_(b)
+        , logger_(l)
+        , sock_(std::move(s))
+        , role_(r)
+        , name_((r == role::publisher ? std::string("pub") : std::string("sub")) + "-" +
+                std::to_string(*sock_))
+    {
+    }
+
   public:
     virtual ~client() noexcept = default;
 
@@ -88,22 +105,6 @@ class client
     }
 
   protected:
-    toymq::broker& broker_;
-    tbd::logger& logger_;
-    tbd::io_socket sock_;
-    const toymq::role role_;
-    const std::string name_;
-
-    client(broker& b, tbd::logger& l, tbd::io_socket& s, toymq::role r) noexcept
-        : broker_(b)
-        , logger_(l)
-        , sock_(std::move(s))
-        , role_(r)
-        , name_((r == role::publisher ? std::string("pub") : std::string("sub")) + "-" +
-                std::to_string(*sock_))
-    {
-    }
-
     virtual bool dispatch(const message& msg) = 0;
     virtual void notify_close() = 0;
 };
@@ -188,21 +189,31 @@ class subscriber
     : public client
     , public std::enable_shared_from_this<subscriber>
 {
+    std::string client_id_;
+    std::string topic_;
+    std::string matcher_;
+    size_t shard_ = 0;
+    std::mutex mtx_;
+    std::deque<std::shared_ptr<message>> drainq_;
+    std::unordered_set<uint64_t> unacked_msgids_;
+    std::atomic<bool> leaving_{false};
+
   public:
-    subscriber(broker& b, tbd::logger& l, tbd::io_socket& s, std::string_view t,
-               std::string_view uuid)
+    subscriber(broker& b, tbd::logger& l, tbd::io_socket& s, const message& msg, size_t shard)
         : client(b, l, s, role::subscriber)
-        , topic_(t)
-        , client_id_(uuid)
+        , client_id_((const char*)msg.data())
+        , topic_(msg.topic())
+        , matcher_(topic_)
+        , shard_(shard)
     {
         sock_.set_nonblock(false);
 
-        if (topic_ == "*") {
-            topic_.clear();
+        if (matcher_ == "*") {
+            matcher_.clear();
         } else {
-            auto n = topic_.size();
-            if (n >= 3 && topic_[n - 2] == '.' && topic_[n - 1] == '*') {
-                topic_.erase(n - 1);  // "foo.bar.*" => "foo.bar."
+            auto n = matcher_.size();
+            if (n >= 3 && matcher_[n - 2] == '.' && matcher_[n - 1] == '*') {
+                matcher_.erase(n - 1);  // "foo.bar.*" => "foo.bar."
             }
         }
     }
@@ -212,16 +223,31 @@ class subscriber
         return client_id_;
     }
 
+    const std::string& topic() const noexcept
+    {
+        return topic_;
+    }
+
+    size_t shard() const noexcept
+    {
+        return shard_;
+    }
+
+    bool leaving() const noexcept
+    {
+        return leaving_;
+    }
+
     bool match(std::string_view msg_topic) const
     {
         bool match = false;
-        if (topic_.empty()) {
+        if (matcher_.empty()) {
             match = true;
-        } else if (topic_.size() > msg_topic.size()) {
+        } else if (matcher_.size() > msg_topic.size()) {
             match = false;
         } else {
-            auto pos = msg_topic.find(topic_);
-            match = (pos == 0 && (msg_topic.size() == topic_.size() || topic_.back() == '.'));
+            auto pos = msg_topic.find(matcher_);
+            match = (pos == 0 && (msg_topic.size() == matcher_.size() || matcher_.back() == '.'));
         }
 
         logger_.debug("%s: my topic [%s], msg topic [%s] => match=%s", name(), topic_.c_str(),
@@ -261,13 +287,20 @@ class subscriber
         if (!drainq_.empty() && !leaving_) {
             auto iovcnt = std::min(drainq_.size(), (size_t)UIO_MAXIOV);
             std::vector<struct iovec> iov(iovcnt);
+            bool summarize = iovcnt > 10;  // XXX
             std::string ids;
             ids.reserve(256);
             auto it = drainq_.begin();
             for (size_t i = 0; i < iovcnt; ++i, ++it) {
                 iov[i].iov_base = (*it)->hdr();
                 iov[i].iov_len = (*it)->length();
-                ids.append(" ").append(std::to_string((*it)->id()));
+                if (likely(!summarize)) {
+                    ids.append(" ").append(std::to_string((*it)->id()));
+                } else if (unlikely(i == 0)) {
+                    ids.append(" ").append(std::to_string((*it)->id()));
+                } else if (unlikely(i == iovcnt - 1)) {
+                    ids.append(" - ").append(std::to_string((*it)->id()));
+                }
             }
             struct msghdr msg = {};
             msg.msg_iov = iov.data();
@@ -285,13 +318,6 @@ class subscriber
     }
 
   private:
-    std::string topic_;
-    std::string client_id_;
-    std::mutex mtx_;
-    std::deque<std::shared_ptr<message>> drainq_;
-    std::unordered_set<uint64_t> unacked_msgids_;
-    std::atomic<bool> leaving_{false};
-
     // reactor
     bool dispatch(const message& msg) override
     {
@@ -305,13 +331,12 @@ class subscriber
 
             case command::unsubscribe:
                 logger_.info("%s: unsubscribe", name());
-                leaving_ = true;
-                broker_.unsubscribe(weak_from_this());
+                notify_close(true);
                 return false;
 
             default:
                 logger_.error("%s: unexpected command [%x]", name(), (uint8_t)msg.command());
-                broker_.close_subscriber(client_id_);
+                notify_close();
                 return false;
             }
 
@@ -323,7 +348,14 @@ class subscriber
 
     void notify_close() override
     {
-        broker_.close_subscriber(client_id_);
+        notify_close(false);
+    }
+
+    void notify_close(bool unsub)
+    {
+        leaving_ = true;
+        broker_.close_subscriber(shared_from_this(), unsub);
+        sock_.close();
     }
 };
 
