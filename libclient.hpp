@@ -18,6 +18,12 @@ class publisher
         : sock_(ipaddr, port)
     {
         sock_.set_nonblock(false);
+        sock_.connect();
+    }
+
+    void publish_oneshot(std::string_view topic, std::string_view msg)
+    {
+        helper::sendmsg(*sock_, command::publish_oneshot, topic, msg.data(), msg.size());
     }
 
     bool publish(std::string_view topic, std::string_view msg, bool require_ack = false)
@@ -27,12 +33,6 @@ class publisher
 
     bool publish(std::string_view topic, const void* data, size_t size, bool require_ack)
     {
-        sock_.connect();
-        if (once_flag_) {
-            auto [_, lport] = sock_.local_endpoint();
-            printf("publisher: localport = %u\n", lport);
-            once_flag_ = false;
-        }
         auto c = require_ack ? command::publish_ack : command::publish;
         if (auto ec = helper::sendmsg(*sock_, c, topic, data, size)) {
             throw std::system_error(ec, "sendmsg");
@@ -54,7 +54,6 @@ class publisher
 
   private:
     tbd::tcp_client sock_;
-    bool once_flag_ = true;
 };
 
 class subscriber
@@ -75,30 +74,26 @@ class subscriber
             save_client_id();
         }
 
-        printf("subscriber id = %s\n", uuid_.c_str());
         sock_.set_nonblock(false);
+        sock_.connect();
+    }
+
+    const std::string& client_id() const noexcept
+    {
+        return uuid_;
     }
 
     void subscribe(std::string_view topic,
                    const std::function<bool(const subscriber::message& msg)>& callback)
     {
-        sock_.connect();
-        auto [_, lport] = sock_.local_endpoint();
-        printf("subscriber: localport = %u\n", lport);
         helper::sendmsg(*sock_, command::subscribe, topic, uuid_.data(), 37);
 
         while (true) {
             auto [msg, ec] = helper::recvmsg(*sock_, true);
             if (ec) {
-                printf("subscribe: recvmsg error: %s\n", ec.message().c_str());
-                break;
+                throw std::system_error(ec, "recvmsg");
             }
-            if (msg.command() != command::push) {
-                printf("subscribe: receive not push command (%u), disconnect\n",
-                       (uint8_t)msg.command());
-                break;
-            }
-            // printf("send_ack for msg %lu\n", msg.id());
+            assert(msg.command() == command::push);
             helper::send_ack(*sock_, msg.id());
 
             subscriber::message m;

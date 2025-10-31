@@ -22,6 +22,9 @@ enum class role : uint8_t
     subscriber,
 };
 
+/****************************************************************************
+ * protocol
+ */
 static constexpr uint8_t VERSION = 1;
 
 enum class command : uint8_t
@@ -155,7 +158,7 @@ struct message
         return {begin, end};
     }
 
-    void data(const void* b, size_t s) noexcept
+    void data(const void* b, uint16_t s) noexcept
     {
         *(uint16_t*)(payload() + sizeof(uint8_t) + topic_size()) = htons(s);
         ::memcpy(data(), b, s);
@@ -163,6 +166,9 @@ struct message
 };
 
 namespace helper {
+/****************************************************************************
+ * recv helper
+ */
 int recv_exact(int sockfd, void* buf, size_t size, bool waitall = true)
 {
     auto* ptr = (uint8_t*)buf;
@@ -171,7 +177,11 @@ int recv_exact(int sockfd, void* buf, size_t size, bool waitall = true)
         auto nread = ::recv(sockfd, ptr, want, waitall ? MSG_WAITALL : MSG_DONTWAIT);
         if (nread < 0) {
             if (errno == EINTR) {
+#if 0
                 continue;
+#else
+                return errno;
+#endif
             }
             if ((errno == EAGAIN || errno == EWOULDBLOCK) && waitall) {
                 continue;
@@ -206,6 +216,9 @@ std::pair<message, std::error_code> recvmsg(int sockfd, bool wait_hdr = false)
     return {std::move(msg), ec};
 }
 
+/****************************************************************************
+ * send helper
+ */
 header* fill_header(const std::vector<uint8_t>& msg, command c, uint16_t size)
 {
     auto* hdr = (header*)msg.data();
