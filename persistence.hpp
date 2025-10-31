@@ -69,7 +69,7 @@ class persistence
     {
         auto n = db_.exec(
             "insert into subscribers (id, topic) values (?, ?) on conflict(id) do update set topic = ?;",
-            {sub->client_id(), sub->topic(), sub->topic()});
+            sub->client_id(), sub->topic(), sub->topic());
         if (n > 0) {
             logger_.debug("broker: insert into subscribers subid %s", sub->client_id());
         }
@@ -77,7 +77,7 @@ class persistence
 
     void delete_subscriber(const std::string& subid)
     {
-        auto n = db_.exec("delete from subscribers where id = ?;", {subid});
+        auto n = db_.exec("delete from subscribers where id = ?;", subid);
         if (n > 0) {
             logger_.debug("broker: delete from subscribers subid %s", subid.c_str());
         }
@@ -103,10 +103,13 @@ class persistence
                 db_.begin([&](auto& txn) {
                     auto n = txn.exec(
                         "insert into messages (id, expiry, size, topic, body_size, body) values (?, ?, ?, ?, ?, ?);",
-                        {(int64_t)msg->id(),
-                         duration_cast<nanoseconds>(expiry.time_since_epoch()).count(),
-                         (int64_t)msg->length(), std::string(msg->topic()),
-                         (int64_t)msg->data_size(), std::make_pair(msg->data(), msg->data_size())});
+                        (int64_t)msg->id(),                                             // id
+                        duration_cast<nanoseconds>(expiry.time_since_epoch()).count(),  // expiry
+                        msg->length(),                                                  // size
+                        msg->topic().data(),                                            // topic
+                        msg->data_size(),                                               // body_size
+                        std::make_pair(msg->data(), msg->data_size())                   // body
+                    );
                     if (n > 0) {
                         logger_.debug("writer: insert into messages msgid %lu", msg->id());
                     }
