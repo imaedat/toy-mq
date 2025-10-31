@@ -59,7 +59,10 @@ class persistence
         auto qsz = bg_writer_.queue_size();
         if (qsz >= 100'000) {
             logger_.info("broker: bg_writer holds too many flush tasks (%lu), wait ...", qsz);
+            logger_.flush();
         }
+        bg_writer_.wait_all();
+        db_.exec("vacuum;");
     }
 
     void insert_subscriber(const std::shared_ptr<subscriber>& sub)

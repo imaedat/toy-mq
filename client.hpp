@@ -193,9 +193,10 @@ class subscriber
     std::string topic_;
     std::string matcher_;
     size_t shard_ = 0;
-    std::mutex mtx_;
     std::deque<std::shared_ptr<message>> drainq_;
+    std::mutex mtx_q_;
     std::unordered_set<uint64_t> unacked_msgids_;
+    std::mutex mtx_u_;
     std::atomic<bool> leaving_{false};
 
   public:
@@ -258,14 +259,14 @@ class subscriber
     // reactor or worker
     void ack_arrived(uint64_t msgid)
     {
-        std::lock_guard<decltype(mtx_)> lk(mtx_);
+        std::lock_guard<decltype(mtx_u_)> lk(mtx_u_);
         unacked_msgids_.erase(msgid);  // O(1)
     }
 
     // reactor
     std::unordered_set<uint64_t> unacked_msgids()
     {
-        std::lock_guard<decltype(mtx_)> lk(mtx_);
+        std::lock_guard<decltype(mtx_u_)> lk(mtx_u_);
         return unacked_msgids_;
     }
 
@@ -273,7 +274,7 @@ class subscriber
     void push(const std::shared_ptr<message>& msg)
     {
         if (unlikely(!leaving_)) {
-            std::lock_guard<decltype(mtx_)> lk(mtx_);
+            std::scoped_lock lk{mtx_q_, mtx_u_};
             unacked_msgids_.emplace(msg->id());
             drainq_.emplace_back(msg);
             broker_.enqueue_flush(weak_from_this());
@@ -283,7 +284,7 @@ class subscriber
     // worker
     void flush()
     {
-        std::lock_guard<decltype(mtx_)> lk(mtx_);
+        std::lock_guard<decltype(mtx_q_)> lk(mtx_q_);
         if (!drainq_.empty() && !leaving_) {
             auto iovcnt = std::min(drainq_.size(), (size_t)UIO_MAXIOV);
             std::vector<struct iovec> iov(iovcnt);
@@ -327,7 +328,6 @@ class subscriber
                 logger_.debug("%s: ack for msg %lu", name(), msg.id());
                 broker_.receive_ack(weak_from_this(), msg);
                 return true;
-                break;
 
             case command::unsubscribe:
                 logger_.info("%s: unsubscribe", name());

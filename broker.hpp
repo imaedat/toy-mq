@@ -304,7 +304,6 @@ class reactor
         lk.unlock();
 
         epollfd_.add(sockfd);
-        // TODO logger_.debug(" add subscriber ");
     }
 
     // reactor
