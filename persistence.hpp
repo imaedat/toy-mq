@@ -67,8 +67,9 @@ class persistence
 
     void insert_subscriber(const std::shared_ptr<subscriber>& sub)
     {
-        auto n = db_.exec("insert into subscribers (id, topic) values (?, ?);",
-                          {sub->client_id(), sub->topic()});
+        auto n = db_.exec(
+            "insert into subscribers (id, topic) values (?, ?) on conflict(id) do update set topic = ?;",
+            {sub->client_id(), sub->topic(), sub->topic()});
         if (n > 0) {
             logger_.debug("broker: insert into subscribers subid %s", sub->client_id());
         }
@@ -90,16 +91,6 @@ class persistence
         bg_writer_.submit([this, msg_wp = std::move(msg_wp), expiry = unacked.expiry,
                            subscribers = unacked.subscribers] {
             if (auto msg = msg_wp.lock()) {
-                auto n = db_.exec(
-                    "insert into messages (id, expiry, size, topic, body_size, body) values (?, ?, ?, ?, ?, ?);",
-                    {(int64_t)msg->id(),
-                     duration_cast<nanoseconds>(expiry.time_since_epoch()).count(),
-                     (int64_t)msg->length(), std::string(msg->topic()), (int64_t)msg->data_size(),
-                     tbd::sqlite::raw_buffer{msg->data(), msg->data_size()}});
-                if (n > 0) {
-                    logger_.debug("writer: insert into messages msgid %lu", msg->id());
-                }
-
                 auto it = subscribers.cbegin();
                 std::ostringstream ss;
                 ss << "insert into delivers (message_id, subscriber_id) values (" << msg->id()
@@ -108,10 +99,23 @@ class persistence
                     ss << "'), (" << msg->id() << ", '" << it->first;
                 }
                 ss << "');";
-                auto m = db_.exec(ss.str());
-                if (m > 0) {
-                    logger_.debug("writer: insert into delivers for %ld subscribers", m);
-                }
+
+                db_.begin([&](auto& txn) {
+                    auto n = txn.exec(
+                        "insert into messages (id, expiry, size, topic, body_size, body) values (?, ?, ?, ?, ?, ?);",
+                        {(int64_t)msg->id(),
+                         duration_cast<nanoseconds>(expiry.time_since_epoch()).count(),
+                         (int64_t)msg->length(), std::string(msg->topic()),
+                         (int64_t)msg->data_size(), std::make_pair(msg->data(), msg->data_size())});
+                    if (n > 0) {
+                        logger_.debug("writer: insert into messages msgid %lu", msg->id());
+                    }
+
+                    auto m = txn.exec(ss.str());
+                    if (m > 0) {
+                        logger_.debug("writer: insert into delivers for %ld subscribers", m);
+                    }
+                });
 
             } else {
                 // logger_.debug("writer: msg already expired (i.e. acked)");
