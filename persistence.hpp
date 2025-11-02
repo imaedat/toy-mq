@@ -103,12 +103,12 @@ class persistence
                 db_.begin([&](auto& txn) {
                     auto n = txn.exec(
                         "insert into messages (id, expiry, size, topic, body_size, body) values (?, ?, ?, ?, ?, ?);",
-                        (int64_t)msg->id(),                                             // id
+                        msg->id(),                                                      // id
                         duration_cast<nanoseconds>(expiry.time_since_epoch()).count(),  // expiry
                         msg->length(),                                                  // size
                         msg->topic().data(),                                            // topic
                         msg->data_size(),                                               // body_size
-                        std::make_pair(msg->data(), msg->data_size())                   // body
+                        tbd::sqlite::blob{msg->data(), msg->data_size()}                // body
                     );
                     if (n > 0) {
                         logger_.debug("writer: insert into messages msgid %lu", msg->id());
