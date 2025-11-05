@@ -6,51 +6,33 @@
 #include <cstring>
 #include <iostream>
 
+#include "../../cpp-libs/cmdopt.hpp"
+
 namespace {
 void signal_handler(int)
 {
     // nop
 }
-
-void usage()
-{
-    std::cerr
-        << "usage: subscribe [-k] [-a ADDR(127.0.0.1)] [-p PORT(55555)] -t TOPIC callback command ..."
-        << std::endl;
-    ::exit(EXIT_FAILURE);
-}
 }  // namespace
 
 int main(int argc, char* argv[])
 {
-    int opt;
-    const char* addr = "127.0.0.1";
-    uint16_t port = 55555;
-    const char* topic = nullptr;
-    bool keep = false;
+    tbd::cmdopt opt(argv[0]);
+    opt.optional('a', "addr", "127.0.0.1", "broker address");
+    opt.optional('p', "port", 55555, "broker port");
+    opt.mandatory('t', "topic", "topic to subscribe");
+    opt.flag('k', "keep", "keep subscribing. in default, unsubscribe after subscribe one message");
+    opt.flag('h', "help", "show this message");
 
-    while ((opt = ::getopt(argc, argv, "ka:p:t:")) != -1) {
-        switch (opt) {
-        case 'k':
-            keep = true;
-            break;
-        case 'a':
-            addr = optarg;
-            break;
-        case 'p':
-            port = ::atoi(optarg);
-            break;
-        case 't':
-            topic = optarg;
-            break;
-        default:
-            usage();
-            break;
-        }
+    auto err = opt.try_parse(argc, argv);
+    if (opt.exists("help")) {
+        std::cerr << opt.usage();
+        ::exit(EXIT_SUCCESS);
     }
-
-    if (!topic) {
-        usage();
+    if (err) {
+        std::cerr << *err << std::endl;
+        std::cerr << opt.usage();
+        ::exit(EXIT_FAILURE);
     }
 
     struct sigaction sa = {};
@@ -60,9 +42,10 @@ int main(int argc, char* argv[])
     ::sigaction(SIGINT, &sa, nullptr);
     ::sigaction(SIGTERM, &sa, nullptr);
 
-    toymq::subscriber sub(addr, port);
+    auto keep = opt.exists("keep");
+    toymq::subscriber sub(opt.get<std::string>("addr"), opt.get<uint16_t>("port"));
     try {
-        sub.subscribe(topic, [&argv, keep](const auto& msg) {
+        sub.subscribe(opt.get<std::string>("topic"), [&argv, &opt](const auto& msg) {
             char buf[msg.data.size() + 1] = {};
             ::memcpy(buf, msg.data.data(), msg.data.size());
 
@@ -74,7 +57,7 @@ int main(int argc, char* argv[])
             cmd.append("\"");
             auto ec = ::system(cmd.c_str());
             (void)ec;
-            return keep;
+            return opt.exists("keep");
         });
 
     } catch (const std::exception& e) {

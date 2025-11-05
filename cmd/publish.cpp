@@ -5,47 +5,28 @@
 #include <cstdlib>
 #include <iostream>
 
-namespace {
-void usage()
-{
-    std::cerr << "usage: publish [-a ADDR(127.0.0.1)] [-p PORT(55555)] -t TOPIC [-m MESSAGE(empty)]"
-              << std::endl;
-    ::exit(EXIT_FAILURE);
-}
-}  // namespace
+#include "../../cpp-libs/cmdopt.hpp"
 
 int main(int argc, char* argv[])
 {
-    int opt;
-    const char* addr = "127.0.0.1";
-    uint16_t port = 55555;
-    const char* topic = nullptr;
-    const char* message = "";
+    tbd::cmdopt opt(argv[0]);
+    opt.optional('a', "addr", "127.0.0.1", "broker address");
+    opt.optional('p', "port", 55555, "broker port");
+    opt.mandatory('t', "topic", "topic to publish");
+    opt.optional('m', "message", "", "message to publish");
+    opt.flag('h', "help", "show this message");
 
-    while ((opt = ::getopt(argc, argv, "a:p:t:m:")) != -1) {
-        switch (opt) {
-        case 'a':
-            addr = optarg;
-            break;
-        case 'p':
-            port = ::atoi(optarg);
-            break;
-        case 't':
-            topic = optarg;
-            break;
-        case 'm':
-            message = optarg;
-            break;
-        default:
-            usage();
-            break;
-        }
+    auto err = opt.try_parse(argc, argv);
+    if (opt.exists("help")) {
+        std::cerr << opt.usage();
+        ::exit(EXIT_SUCCESS);
+    }
+    if (err) {
+        std::cerr << *err << std::endl;
+        std::cerr << opt.usage();
+        ::exit(EXIT_FAILURE);
     }
 
-    if (!topic) {
-        usage();
-    }
-
-    toymq::publisher pub(addr, port);
-    pub.publish_oneshot(topic, message);
+    toymq::publisher pub(opt.get<std::string>("addr"), opt.get<uint16_t>("port"));
+    pub.publish_oneshot(opt.get<std::string>("topic"), opt.get<std::string>("message"));
 }
