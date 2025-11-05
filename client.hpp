@@ -129,7 +129,7 @@ class publisher : public client
         auto [ok, msgid] = broker_.enqueue_deliver(msg, *sock_);
         if (unlikely(!ok)) {
             if (requires_ack) {
-                helper::sendmsg(*sock_, command::nack);
+                (void)helper::sendmsg(*sock_, command::nack);
             }
             logger_.warn("%s: detach for backpressure", name());
             broker_.detach_publisher(*sock_);

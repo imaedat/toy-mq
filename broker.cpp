@@ -188,7 +188,7 @@ again:
                 subscribers_.erase(it);  // last shared_ptr -> dtor
             } else {
                 logger_.error("broker: subscriber id %s is already active, reject it", subid);
-                helper::sendmsg(*sock, command::nack);
+                (void)helper::sendmsg(*sock, command::nack);
                 break;
             }
         }
@@ -259,7 +259,7 @@ void broker::start_residents()
     keeper_.start(keeper_interval, [this] { clean_expired_msg(); });
 
     for (size_t i = 0; i < nreactors_; ++i) {
-        reactors_[i] = std::make_unique<reactor>(cfg_, *this, logger_, i);
+        reactors_[i] = std::make_unique<reactor>(cfg_, logger_, i);
     }
     for (size_t i = 0; i < nrouters_; ++i) {
         routers_[i].i = i;
@@ -275,7 +275,7 @@ void broker::stop_residents()
     std::for_each(reactors_.begin(), reactors_.end(), [](auto&& r) { r->stop(); });
     keeper_.stop();
     sampler_.stop();
-    std::for_each(routers_.begin(), routers_.end(), [this](auto&& r) { join_thread(r.thr); });
+    std::for_each(routers_.begin(), routers_.end(), [](auto&& r) { join_thread(r.thr); });
 }
 
 void broker::msg_router(size_t i)
@@ -588,7 +588,7 @@ bool broker::remove_unacked(uint64_t msgid, const std::string& subid)
 void broker::enqueue_flush(std::weak_ptr<subscriber>&& sub_wp)
 {
     try {
-        thrpool_.submit([this, sub_wp = std::move(sub_wp)] {
+        thrpool_.submit([sub_wp = std::move(sub_wp)] {
             if (auto sub = sub_wp.lock()) {
                 sub->flush();
             }

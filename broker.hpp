@@ -15,7 +15,6 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "config.hpp"
@@ -272,9 +271,8 @@ class reactor
     };  // }}}
 
   public:
-    reactor(const tbd::config& c, broker& b, tbd::logger& l, size_t i)
+    reactor(const tbd::config& c, tbd::logger& l, size_t i)
         : cfg_(c)
-        , broker_(b)
         , logger_(l)
         , name_(std::string("reactor-") + std::to_string(i))
     {
@@ -322,7 +320,6 @@ class reactor
 
   private:
     const tbd::config cfg_;
-    broker& broker_;
     tbd::logger& logger_;
     std::string name_;
     tbd::epollfd epollfd_;

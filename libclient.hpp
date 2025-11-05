@@ -98,7 +98,7 @@ class subscriber
 
             subscriber::message m;
             m.topic = msg.topic();
-            m.data = std::move(msg.clone_data());
+            m.data = msg.clone_data();
             if (!callback(m)) {
                 break;
             }

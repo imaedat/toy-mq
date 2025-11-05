@@ -68,7 +68,7 @@ struct message
         id(msgid);
     }
     // load from db
-    message(size_t size)
+    explicit message(size_t size)
         : buf(size, 0)
     {
         hdr()->version = VERSION;
@@ -169,7 +169,7 @@ namespace helper {
 /****************************************************************************
  * recv helper
  */
-int recv_exact(int sockfd, void* buf, size_t size, bool waitall = true)
+inline int recv_exact(int sockfd, void* buf, size_t size, bool waitall = true)
 {
     auto* ptr = (uint8_t*)buf;
     long want = size;
@@ -198,7 +198,7 @@ int recv_exact(int sockfd, void* buf, size_t size, bool waitall = true)
     return 0;  // SUCCESS
 }
 
-std::pair<message, std::error_code> recvmsg(int sockfd, bool wait_hdr = false)
+inline std::pair<message, std::error_code> recvmsg(int sockfd, bool wait_hdr = false)
 {
     message msg;
     if (auto err = recv_exact(sockfd, msg.hdr(), sizeof(header), wait_hdr)) {
@@ -219,7 +219,7 @@ std::pair<message, std::error_code> recvmsg(int sockfd, bool wait_hdr = false)
 /****************************************************************************
  * send helper
  */
-header* fill_header(const std::vector<uint8_t>& msg, command c, uint16_t size)
+inline header* fill_header(const std::vector<uint8_t>& msg, command c, uint16_t size)
 {
     auto* hdr = (header*)msg.data();
     hdr->version = VERSION;
@@ -228,7 +228,7 @@ header* fill_header(const std::vector<uint8_t>& msg, command c, uint16_t size)
     return hdr;
 }
 
-std::error_code sendmsg(int sockfd, command c, std::string_view topic = "",
+inline std::error_code sendmsg(int sockfd, command c, std::string_view topic = "",
                         const void* data = nullptr, size_t datasz = 0)
 {
     auto msgsz = sizeof(header);
@@ -277,7 +277,7 @@ std::error_code sendmsg(int sockfd, command c, std::string_view topic = "",
     return std::error_code();
 }
 
-std::error_code send_ack(int sockfd, uint64_t msgid)
+inline std::error_code send_ack(int sockfd, uint64_t msgid)
 {
     auto msgsz = sizeof(header) + sizeof(uint64_t);
     std::vector<uint8_t> msg(msgsz);
