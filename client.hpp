@@ -355,7 +355,6 @@ class subscriber
     {
         leaving_ = true;
         broker_.close_subscriber(shared_from_this(), unsub);
-        sock_.close();
     }
 };
 

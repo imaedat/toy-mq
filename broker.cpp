@@ -181,18 +181,26 @@ again:
         auto shard = sockfd % nreactors_;
         auto sub = std::make_shared<subscriber>(*this, logger_, sock, msg, shard);
         const auto& subid = sub->client_id();
+        const auto& pattern = sub->topic();
         std::unique_lock<decltype(mtx_subs_)> lks(mtx_subs_);
-        auto it = subscribers_.find(subid);
-        if (unlikely(it != subscribers_.end())) {
-            if (it->second->leaving()) {
-                subscribers_.erase(it);  // last shared_ptr -> dtor
-            } else {
-                logger_.error("broker: subscriber id %s is already active, reject it", subid);
-                (void)helper::sendmsg(*sock, command::nack);
-                break;
-            }
+        auto it = subscribers_.find(pattern);
+        if (it == subscribers_.end()) {
+            std::tie(it, std::ignore) = subscribers_.emplace(
+                pattern, std::unordered_map<std::string, std::weak_ptr<subscriber>>());
         }
-        subscribers_.emplace(subid, sub);
+        auto jt = it->second.find(subid);
+        if (unlikely(jt != it->second.end())) {
+            auto& sub_wp = jt->second;
+            if (auto sub_sp = sub_wp.lock()) {
+                if (unlikely(!sub_sp->leaving())) {
+                    logger_.error("broker: subscriber id %s is already active, reject it", subid);
+                    (void)helper::sendmsg(*sock, command::nack);
+                    break;
+                }
+            }
+            it->second.erase(jt);
+        }
+        it->second.emplace(subid, sub);
         sub_last_updated_ = steady_clock::now();
         logger_.info("broker: accept new subscriber %s [%s] (fd=%d, reactor-%d)", subid.c_str(),
                      sub->topic().c_str(), *sub->socket(), sub->shard());
@@ -299,19 +307,20 @@ void broker::msg_router(size_t i)
         if (rt.snap.empty() || rt.last_snapped < sub_last_updated_.load()) {
             rt.snap.clear();
             std::shared_lock<decltype(mtx_subs_)> lks(mtx_subs_);
-            rt.snap.reserve(subscribers_.size());
-            for (const auto& [_, sub] : subscribers_) {  // O(n)
-                rt.snap.emplace_back(sub);
-            }
+            rt.snap = subscribers_;  // copy
             rt.last_snapped = steady_clock::now();
         }
 
         // topic matching
         unacked_msg unacked;
-        for (const auto& sub : rt.snap) {
-            if (sub->match(msg->topic())) {
-                unacked.subscribers.emplace(sub->client_id(), sub);
+        unacked.subscribers.reserve(8);
+        for (const auto& pat : expand_patterns(msg->topic())) {
+            auto it = rt.snap.find(pat);  // O(1)
+            if (it == rt.snap.cend()) {
+                continue;
             }
+            auto subs = it->second;  // copy ...
+            unacked.subscribers.merge(std::move(subs));
         }
 
         // enqueue to emit
@@ -345,8 +354,7 @@ void broker::push_to_subscribers(router& rt, unacked_msg& unacked)
             if (auto sub = sub_wp.lock()) {
                 sub->push(unacked.msg);
             } else {
-                rt.snap.clear();
-                logger_.warn("router-%lu: subscriber already closed before push", rt.i);
+                logger_.debug("router-%lu: subscriber already closed before push", rt.i);
             }
         }
 
@@ -542,9 +550,12 @@ void broker::collect_unack(std::weak_ptr<subscriber>&& sub_wp, uint64_t msgid,
 void broker::unsubscribe(const std::shared_ptr<subscriber>& sub)
 {
     std::unique_lock<decltype(mtx_subs_)> lks(mtx_subs_);
-    subscribers_.erase(sub->client_id());
+    auto it = subscribers_.find(sub->topic());
+    if (likely(it != subscribers_.end())) {
+        it->second.erase(sub->client_id());
+        sub_last_updated_ = steady_clock::now();
+    }
     lks.unlock();
-    sub_last_updated_ = steady_clock::now();
 
     thrpool_.submit([this, subid = sub->client_id(), unacked_msgids = sub->unacked_msgids()] {
         bool dec_unacked = false;
@@ -604,7 +615,7 @@ void broker::on_emit(uint64_t count)
 }
 
 // reactor
-void broker::close_subscriber(const std::shared_ptr<subscriber>& sub, bool unsub)
+void broker::close_subscriber(std::shared_ptr<subscriber> sub, bool unsub)
 {
     const auto& subid = sub->client_id();
     reactors_[sub->shard()]->notify_close(sub->client_id());

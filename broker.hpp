@@ -35,6 +35,44 @@ void join_thread(std::thread& thr)
         thr.join();
     }
 }
+
+/**
+ * "foo.bar.baz" => [ "*", "foo.*", "foo.bar.*", "foo.bar.baz" ]
+ *
+ * - sub1: "foo.bar.*"
+ * - sub2: "foo.bar"
+ * - sub3: "foo.*"
+ * - sub4: "foo"
+ * - sub5: "*"
+ *
+ * 1. pub "foo"         =>             sub3, sub4, sub5
+ * 2. pub "foo.bar"     => sub1, sub2, sub3,       sub5
+ * 3. pub "foo.bar.baz" => sub1,       sub3,       sub5
+ *
+ * {
+ *   "*"          : [sub5],
+ *   "foo"        : [sub4],
+ *   "foo.*"      : [sub3],
+ *   "foo.bar"    : [sub2],
+ *   "foo.bar.*"  : [sub1],
+ *   "foo.bar.baz": []
+ * }
+ */
+std::vector<std::string> expand_patterns(std::string_view topic)
+{
+    std::vector<std::string> prefixes{"*"};
+    size_t pos = 0;
+    while (true) {
+        pos = topic.find('.', pos);
+        prefixes.emplace_back(topic.substr(0, pos));
+        if (pos == std::string_view::npos) {
+            break;
+        }
+        prefixes.back().append(".*");
+        ++pos;
+    }
+    return prefixes;
+}
 }  // namespace
 
 /****************************************************************************
@@ -118,7 +156,8 @@ class broker
         std::condition_variable cv;
         std::mutex mtx;
         std::deque<std::shared_ptr<message>> queue;
-        std::vector<std::shared_ptr<subscriber>> snap;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::weak_ptr<subscriber>>>
+            snap;
         std::chrono::steady_clock::time_point last_snapped;
     };
     struct metrics
@@ -148,8 +187,9 @@ class broker
     // { fd => publisher }
     std::unordered_map<int, std::unique_ptr<publisher>> publishers_;
     std::shared_mutex mtx_pubs_;
-    // { subid => subscriber }
-    std::unordered_map<std::string, std::shared_ptr<subscriber>> subscribers_;
+    // { topic(pattern) => { subid => subscriber } }
+    std::unordered_map<std::string, std::unordered_map<std::string, std::weak_ptr<subscriber>>>
+        subscribers_;
     std::shared_mutex mtx_subs_;
 
     // { msgid => { msg, expiry, subscribers } }
@@ -186,7 +226,7 @@ class broker
     void receive_ack(std::weak_ptr<subscriber>&& sub_wp, const message& msg);
     void enqueue_flush(std::weak_ptr<subscriber>&& sub_wp);
     void on_emit(uint64_t count = 1);
-    void close_subscriber(const std::shared_ptr<subscriber>& subid, bool unsub = false);
+    void close_subscriber(std::shared_ptr<subscriber> subid, bool unsub = false);
 
   private:
     bool run_one();
