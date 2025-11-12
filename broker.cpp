@@ -286,7 +286,7 @@ void broker::msg_router(size_t i)
     std::unique_lock<std::mutex> lkr(rt.mtx);
     while (true) {
         rt.cv.wait(lkr, [this, &rt] { return !rt.queue.empty() || !running_; });
-        if (!running_) {
+        if (!running_ && rt.queue.empty()) {
             break;
         }
 
